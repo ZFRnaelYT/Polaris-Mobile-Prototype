@@ -1,11 +1,13 @@
--- POLARIS v0.8.1 | Client experimental, sans dependance distante.
+-- POLARIS v0.9 | Client experimental, sans dependance distante.
 -- Input: polaris_mobile(1).lua v0.5, SHA256 deae6e159f1269edb6bccd6175315a4c1bb2a7161f60e184ade9da970a527dab.
 -- Implemented: shared movement, bounded exits, exact property restoration,
 -- foreground scheduler, cancellable background queue, observable inventory checks.
 -- Partial: historical quest catalog, ordinary Tool:Activate combat, Sword/Melee mastery,
 -- material sources, visible-fruit collection/storage, Gacha, existing V2 flower chain.
 -- Legendary purchases: visible NPC dialogue only, exact sword and displayed Beli price required.
--- Experimental: normal-input Fruit/Gun skills, current-seat boat navigation, V3 assistance, Saber plates, visible summon prompts.
+-- Experimental: normal-input skills, current-seat navigation, V3 assistance, Saber plates, Soul Reaper.
+-- Added: loaded maritime targets with readable HP, skill-only Sea Beast combat, boat patrol and loaded Mirage approach.
+-- V4 is guidance/preflight only; no automatic trials or completed awakening is claimed.
 -- NOT COMPLETE: full V3 for all races, all summons and all puzzles. Live-game validation still required.
 -- No universal server compatibility, zero-lag or undetected-execution guarantee.
 -- Purchases use configurable estimates, reserve and conservative session budgets.
@@ -15,6 +17,8 @@
 -- Roblox/creator-docs/LICENSE: CC BY 4.0. API semantics studied, no documentation text copied.
 -- https://create.roblox.com/docs/reference/engine/classes/VehicleSeat
 -- https://create.roblox.com/docs/reference/engine/classes/VirtualInputManager
+-- https://bffr.fr/wiki/en/activites/sea-beast/
+-- https://bffr.fr/wiki/en/guides/race-awakening/
 -- https://bffr.fr/wiki/en/quetes/arowe/
 -- https://bffr.fr/wiki/en/objets/ancient-relic/
 -- https://create.roblox.com/docs/reference/engine/classes/LinearVelocity
@@ -380,6 +384,7 @@ local function newMovement(player,services,config,report,clock)
     local self={root=nil,goal=nil,raw=nil,tween=nil,blocked=nil,closed=false}
     local controller=services.characterController
     local deadline,lastProgress,best,lastPosition=0,0,0,nil
+    local speedUsed=0
     local corrections=0
     local function character()
         local c=player.Character;local h=c and c:FindFirstChildOfClass("Humanoid")
@@ -451,14 +456,15 @@ local function newMovement(player,services,config,report,clock)
             h.Sit=false;return false
         end
         local now=clock()
-        if self.root==r and self.raw and (self.raw.Position-cf.Position).Magnitude<4 then
+        local speed=math.clamp(tonumber(config.speed) or 220,80,320)
+        if speed==speedUsed and self.root==r and self.raw and (self.raw.Position-cf.Position).Magnitude<4 then
             local remaining=(r.Position-self.goal.Position).Magnitude
             if remaining<=math.min(tolerance or 3,1.5) then
                 if not self:stop() then error(self.blocked) end
                 return true
             end
             if remaining<best-0.75 then best=remaining;lastProgress=now end
-            if lastPosition and (r.Position-lastPosition).Magnitude>config.speed*0.6+8 and remaining>best+5 then corrections=corrections+1 end
+            if lastPosition and (r.Position-lastPosition).Magnitude>speed*0.6+8 and remaining>best+5 then corrections=corrections+1 end
             lastPosition=r.Position
             if corrections>=2 or now-lastProgress>5 or now>deadline then
                 local reason=corrections>=2 and "Corrections serveur suspectees" or "Progression non confirmee (serveur/physique)"
@@ -473,8 +479,9 @@ local function newMovement(player,services,config,report,clock)
         local distance=(r.Position-goal.Position).Magnitude
         if distance<1.5 then return self:stop() end
         controller:setFlying(true)
-        deadline=now+distance/config.speed+12;lastProgress=now;best=distance;lastPosition=r.Position;corrections=0
-        self.tween=services.TweenService:Create(r,TweenInfo.new(math.max(0.15,distance/config.speed),Enum.EasingStyle.Linear),{CFrame=goal})
+        speedUsed=speed
+        deadline=now+distance/speed+12;lastProgress=now;best=distance;lastPosition=r.Position;corrections=0
+        self.tween=services.TweenService:Create(r,TweenInfo.new(math.max(0.15,distance/speed),Enum.EasingStyle.Linear),{CFrame=goal})
         self.tween:Play();return false
     end
     function self:close()
@@ -1449,7 +1456,7 @@ local function newAdapter(player,remote,services,config,report)
         state("sword","en attente","Achat unique envoye via dialogue; possession a confirmer")
         return false
     end
-    local function skillCombat(target,tool,now)
+    local function skillCombat(target,tool,now,hoverCombat,taskId)
         local c,h,r=character();if not c then releaseInput();return false end
         local er=target and target:FindFirstChild("HumanoidRootPart")
         local eh=target and target:FindFirstChildOfClass("Humanoid")
@@ -1463,7 +1470,8 @@ local function newAdapter(player,remote,services,config,report)
             if not moveTo(er.CFrame*CFrame.new(0,2,config.skillRange*0.6),3) then return false end
             if (r.Position-er.Position).Magnitude>config.skillRange then return false end
         end
-        if not stopMovement() then error(movement.blocked) end
+        if hoverCombat then services.characterController:setFlying(true)
+        elseif not stopMovement() then error(movement.blocked) end
         if tool.Parent~=c then h:EquipTool(tool) end
         r.CFrame=CFrame.lookAt(r.Position,Vector3.new(er.Position.X,r.Position.Y,er.Position.Z))
         if now<skillNext or pulseKey then return false end
@@ -1484,7 +1492,7 @@ local function newAdapter(player,remote,services,config,report)
         skillCursor=skillCursor%#selected+1;pulse(selected[skillCursor],now)
         if tool.ToolTip=="Gun" then tool:Activate() end
         skillNext=now+config.skillInterval
-        state("mastery","en combat","Commandes normales / "..selected[skillCursor].." ; degats/mastery observes")
+        state(taskId or "mastery","en combat","Commandes normales / "..selected[skillCursor].." ; degats/mastery observes")
         return false
     end
     local priorMastery=mastery
@@ -1783,6 +1791,263 @@ local function newAdapter(player,remote,services,config,report)
     function adapter.diagnostics()
         local d=advancedDiagnostics();d.legendarySpent=legendarySpent;d.race3=v3.stage;d.boat=boatSeat and boatSeat.Name or "--";return d
     end
+    -- Loaded-world maritime targets; no template scanning or guessed sea-event remotes.
+    local marineTargets,marineScan={},-math.huge
+    local marineFacades=setmetatable({},{__mode="k"})
+    local marineCurrent,marineCompleted=nil,0
+    local searchStarted,patrolAnchor,patrolIndex=nil,nil,1
+    local mirageOriginal,mirageRouting,mirageRouteIsland,mirageRouteTarget=nil,false,nil,nil
+    local function maritimeName(model)
+        local name=model.Name:gsub("%s*%[.*%]","")
+        local lower=name:lower():gsub("%s","")
+        if lower:match("^seabeast%d*$") then return "Sea Beast" end
+        return name
+    end
+    local function marineHealth(model)
+        local humanoid=model:FindFirstChildOfClass("Humanoid")
+        if humanoid then return function() return humanoid.Health,humanoid.MaxHealth end end
+        local value=model:FindFirstChild("Health")
+        if value and (value:IsA("NumberValue") or value:IsA("IntValue")) then
+            local maximum=model:FindFirstChild("MaxHealth")
+            local initial=value.Value
+            return function() return value.Value,maximum and maximum.Value or initial end
+        end
+        local attr=model:GetAttribute("Health")
+        if type(attr)=="number" then
+            local initial=attr
+            return function() return model:GetAttribute("Health"),model:GetAttribute("MaxHealth") or initial end
+        end
+    end
+    local function marineFacade(model)
+        if marineFacades[model] then return marineFacades[model] end
+        local root=model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart or model:FindFirstChild("RootPart")
+        local read=marineHealth(model)
+        if not root or not root:IsA("BasePart") or not read then return end
+        local health=setmetatable({},{__index=function(_,field) local hp,max=read();if field=="Health" then return hp or 0 elseif field=="MaxHealth" then return max or 1 end end})
+        local proxy={model=model,root=root,read=read}
+        function proxy:FindFirstChild(name) if name=="HumanoidRootPart" then return self.root end end
+        function proxy:FindFirstChildOfClass(class) if class=="Humanoid" then return health end end
+        marineFacades[model]=proxy;return proxy
+    end
+    local function scanMarine(now)
+        if now-marineScan<1 then return end
+        marineScan=now;marineTargets={}
+        local seen={}
+        for _,folderName in ipairs({"Enemies","SeaBeasts","Sea Beast"}) do
+            local folder=workspace:FindFirstChild(folderName)
+            for _,model in ipairs(folder and folder:GetChildren() or {}) do
+                if model:IsA("Model") and not seen[model] then
+                    seen[model]=true
+                    local name=maritimeName(model)
+                    if name=="Sea Beast" or name=="Piranha" or name=="Fish Crew Member" or name=="Shark" or name=="Terrorshark" then
+                        local proxy=marineFacade(model)
+                        marineTargets[#marineTargets+1]={name=name,model=model,proxy=proxy}
+                    end
+                end
+            end
+        end
+    end
+    local function selectedMarine(now,wanted)
+        scanMarine(now)
+        local _,_,root=character();if not root then return end
+        local best,dist=nil,config.marineDetectRange
+        for _,target in ipairs(marineTargets) do
+            if wanted[target.name] and target.model.Parent and target.proxy then
+                local health=target.proxy.read()
+                if type(health)=="number" and health>0 then
+                    local d=(root.Position-target.proxy.root.Position).Magnitude
+                    if d<dist then best,dist=target,d end
+                end
+            end
+        end
+        return best
+    end
+    local function wantedMarine()
+        local result={}
+        for raw in config.marineTargets:gmatch("[^,]+") do
+            local name=raw:match("^%s*(.-)%s*$")
+            if name~="Sea Beast" and name~="Piranha" and name~="Fish Crew Member" and name~="Shark" and name~="Terrorshark" then error("Cible maritime inconnue : "..name) end
+            result[name]=true
+        end
+        return result
+    end
+    local function restoreMirageRoute()
+        if mirageRouting then config.boatDestination=mirageOriginal;mirageRouting=false;mirageOriginal=nil end
+        mirageRouteIsland=nil;mirageRouteTarget=nil
+    end
+    local function patrol(now,id)
+        local _,h=character();if not h then state(id,"en attente","Respawn");return false end
+        if not config.marinePatrol then state(id,"en attente","Aucune cible chargee. Patrouille OFF; aucune apparition garantie");return true end
+        if not searchStarted then searchStarted=now end
+        if now-searchStarted>config.marineSearchSeconds then boatStop();error("Recherche maritime terminee sans cible dans le delai configure") end
+        if not patrolAnchor then
+            local seat=h.SeatPart or boatSeat
+            if not seat or not seat.Parent then state(id,"en attente","Assieds-toi dans un bateau possede avant la patrouille");return true end
+            patrolAnchor=seat.Position
+        end
+        local points={Vector3.new(1,0,0),Vector3.new(0,0,1),Vector3.new(-1,0,0),Vector3.new(0,0,-1)}
+        local saved=config.boatDestination
+        config.boatDestination=patrolAnchor+points[patrolIndex]*config.marineSearchRadius
+        local ok,done=pcall(boat,now)
+        config.boatDestination=saved
+        if not ok then error(done) end
+        if done and statuses.boat and statuses.boat.state=="terminee" then patrolIndex=patrolIndex%4+1 end
+        state(id,"en deplacement","Patrouille bateau bornee / point "..patrolIndex.." ; aucun fly maritime")
+        return false
+    end
+    local function marineFight(target,now,id)
+        local c,h=character();if not c then releaseInput();state(id,"en attente","Respawn");return false end
+        if marineCurrent and marineCurrent~=target.model then
+            local previous=marineFacades[marineCurrent]
+            if previous then local health=previous.read();if health and health<=0 then marineCompleted=marineCompleted+1 end end
+        end
+        marineCurrent=target.model
+        if h.Health/h.MaxHealth<config.marineHealthReserve then
+            releaseInput();boatStop()
+            state(id,"en attente","Sante faible; retour au bateau, aucune attaque")
+            local saved=config.boatDestination
+            if boatSeat and boatSeat.Parent then config.boatDestination=boatSeat.Position;local ok,err=pcall(boat,now);config.boatDestination=saved;if not ok then error(err) end end
+            return false
+        end
+        -- Stop seat controls before leaving it; flight never controls the boat.
+        if boatOriginal or h.SeatPart then boatStop() end
+        if h.SeatPart and h.SeatPart:IsA("VehicleSeat") then
+            boatSeat=h.SeatPart;h.Sit=false;state(id,"en attente","Quitter le siege avant le combat");return false
+        end
+        local tool=findTool(config.marineTool)
+        if not tool then error("Choisir le nom exact d'un equipement maritime possede") end
+        if tool.ToolTip~="Blox Fruit" and tool.ToolTip~="Gun" and tool.ToolTip~="Sword" and tool.ToolTip~="Melee" then error("Equipement sans skills reconnus") end
+        local pos=target.proxy.root.CFrame*CFrame.new(0,math.min(config.marineHeight,config.skillRange*0.4),config.skillRange*0.5)
+        local _,_,root=character()
+        if movement.goal or (root.Position-pos.Position).Magnitude>4 then
+            releaseInput()
+            if not moveTo(pos,3) then state(id,"en deplacement","Approche fantome / "..target.name);return false end
+        end
+        -- Hover is temporary, owned by this foreground task, and cleaned on transfer.
+        services.characterController:setFlying(true)
+        skillCombat(target.proxy,tool,now,true,id)
+        state(id,"en combat",target.name.." / skills normaux; provenance et drops non garantis")
+        return false
+    end
+    local function marine(now,id)
+        id=id or "marine"
+        if sea~=2 and sea~=3 then error("Evenements marins : Sea 2 ou Sea 3 requise") end
+        local wanted=id=="seafish" and {["Piranha"]=true,["Fish Crew Member"]=true,["Shark"]=true} or wantedMarine();local target=selectedMarine(now,wanted)
+        if target then searchStarted=nil;return marineFight(target,now,id) end
+        for _,entry in ipairs(marineTargets) do
+            if wanted[entry.name] and not entry.proxy then
+                state(id,"en attente",entry.name.." detecte, mais sante/position non lisibles : schema non pris en charge")
+                return true
+            end
+        end
+        if marineCurrent then
+            local previous=marineFacades[marineCurrent];local health=previous and previous.read()
+            if health and health<=0 then marineCompleted=marineCompleted+1 end
+            marineCurrent=nil;releaseInput()
+            if not stopMovement() then error(movement.blocked) end
+        end
+        return patrol(now,id)
+    end
+    local function mirageObject()
+        local map=workspace:FindFirstChild("Map")
+        local island=map and (map:FindFirstChild("MysticIsland") or map:FindFirstChild("Mirage Island"))
+        return island
+    end
+    local function miragePosition(island)
+        local cf=positionOf(island)
+        if cf then return cf.Position end
+        if island:IsA("Model") then return island:GetPivot().Position end
+        local part=island:FindFirstChildWhichIsA("BasePart",true)
+        return part and part.Position
+    end
+    local function mirage(now)
+        if sea~=3 then error("Mirage : Sea 3 requise") end
+        local island=mirageObject()
+        if not island then restoreMirageRoute();return patrol(now,"mirage") end
+        local pos=miragePosition(island)
+        if not pos then state("mirage","en attente","Mirage chargee sans position exploitable");return true end
+        local _,h,root=character();if not root then return false end
+        if not h.SeatPart or not h.SeatPart:IsA("VehicleSeat") then
+            state("mirage","en attente","Mirage detectee; rester/revenir dans un bateau pour l'approche maritime")
+            local saved=config.boatDestination;config.boatDestination=pos
+            local ok,result=pcall(boat,now);config.boatDestination=saved;if not ok then error(result) end
+            return false
+        end
+        local delta=h.SeatPart.Position-pos;delta=Vector3.new(delta.X,0,delta.Z)
+        if mirageRouteIsland~=island or not mirageRouteTarget then
+            mirageRouteIsland=island
+            mirageRouteTarget=delta.Magnitude>1 and pos+delta.Unit*config.mirageStandOff or pos+Vector3.new(config.mirageStandOff,0,0)
+        end
+        local shore=mirageRouteTarget
+        if (Vector3.new(root.Position.X,0,root.Position.Z)-Vector3.new(shore.X,0,shore.Z)).Magnitude<=config.boatTolerance then
+            boatStop();restoreMirageRoute();state("mirage","terminee","Mirage chargee approchee. Gear, resonance et trials restent a verifier/realiser.");return true
+        end
+        if not mirageRouting then mirageOriginal=config.boatDestination;mirageRouting=true end
+        config.boatDestination=shore
+        local done=boat(now);state("mirage","en deplacement","Approche Mirage par bateau; aucun scan des zones non chargees")
+        return false
+    end
+    local earlierRace3=race3
+    race3=function(now)
+        local race=player.Data.Race.Value
+        if v3.stage=="work" and (race=="Shark" or race=="Fishman") then
+            local target=selectedMarine(now,{["Sea Beast"]=true})
+            if target then
+                local health=target.proxy.read()
+                if health and health>0 then return marineFight(target,now,"race3") end
+            end
+            if marineCurrent then
+                local proxy=marineFacades[marineCurrent];local health=proxy and proxy.read()
+                if health and health<=0 then
+                    marineCurrent=nil;releaseInput();v3.stage="inspect";interactions.race3=nil
+                    return interactNpc("Arowe","race3",now)
+                end
+            end
+            state("race3","en attente","Attente Sea Beast charge; provenance naturelle non confirmee, Arowe valide la quete")
+            return patrol(now,"race3")
+        end
+        return earlierRace3(now)
+    end
+    local baseReady,baseStep,baseSuspend,baseClose=adapter.ready,adapter.step,adapter.suspend,adapter.close
+    function adapter.ready(id,now)
+        if id=="marine" or id=="seafish" or id=="mirage" then
+            scanMarine(now)
+            if id=="mirage" and mirageObject() then return true end
+            if id~="mirage" and selectedMarine(now,id=="seafish" and {["Piranha"]=true,["Fish Crew Member"]=true,["Shark"]=true} or wantedMarine()) then return true end
+            if id~="mirage" then
+                local wanted=id=="seafish" and {["Piranha"]=true,["Fish Crew Member"]=true,["Shark"]=true} or wantedMarine()
+                for _,entry in ipairs(marineTargets) do
+                    if wanted[entry.name] and not entry.proxy then state(id,"en attente",entry.name.." detecte : sante/position non lisibles, schema non pris en charge");return false end
+                end
+            end
+            if config.marinePatrol then return true end
+            state(id,"en attente","Aucune cible/ile chargee; patrouille OFF")
+            return false
+        end
+        return baseReady(id,now)
+    end
+    function adapter.step(id,now)
+        if id=="marine" or id=="seafish" then currentId=id;return marine(now,id) end
+        if id=="mirage" then currentId=id;return mirage(now) end
+        return baseStep(id,now)
+    end
+    function adapter.suspend(id,transfer)
+        if id=="marine" or id=="seafish" or id=="mirage" then
+            releaseInput();boatStop();restoreMirageRoute()
+            if transfer then return movement:handoff() end
+            return movement:stop()
+        end
+        return baseSuspend(id,transfer)
+    end
+    function adapter.close() restoreMirageRoute();return baseClose() end
+    function adapter.raceOverview(now)
+        requestInventory(now)
+        local data=player:FindFirstChild("Data");local race=data and data:FindFirstChild("Race")
+        return {race=race and race.Value or "?",v2=race and race:FindFirstChild("Evolved")~=nil or false,
+            v3Confirmed=statuses.race3 and statuses.race3.state=="terminee" or false,
+            mirrorFractal=count("Mirror Fractal"),mirageLoaded=mirageObject()~=nil,
+            v4="Trials, resonance, levier et horloge non implementes"}
+    end
 
     return adapter
 end
@@ -1795,16 +2060,19 @@ assert(player,"Polaris doit etre execute cote client")
 local playerGui=player:WaitForChild("PlayerGui")
 local old=playerGui:FindFirstChild("PolarisMobileDemo")
 if old then local event=old:FindFirstChild("Cleanup");if event then event:Fire() end;assert(not old:GetAttribute("PolarisBlocked"),"Ancien trajet bloque : liberer une sortie avant de remplacer Polaris");old:Destroy() end
-local config={bosses=true,weapon="Melee",speed=140,fruitRange=5000,phaseFlight=true,exitRadius=10,
+local config={bosses=true,weapon="Melee",speed=220,fruitRange=5000,phaseFlight=true,exitRadius=10,
  reserve=100000,gachaBudget=0,gachaMaxPrice=500000,shopBudget=0,shopMaxPrice=1200000,excludeFruits="",
  masteryTool="",masteryGoal=300,masteryThreshold=0.25,itemQuantity=10,replaceQuest=false,
  legendaryTargets="Saddi,Shisui,Wando",legendaryBudget=0,legendaryMaxPrice=2000000,
  skillKeys="Z,X",skillInterval=6,skillHold=0.15,skillRange=30,skillAim=true,
- boatTolerance=35,race3Budget=0,allowRare=false,summonTarget="Soul Reaper",puzzleTarget="Saber plates"}
+ boatTolerance=35,race3Budget=0,allowRare=false,summonTarget="Soul Reaper",puzzleTarget="Saber plates",marineTargets="Sea Beast",marineTool="",marinePatrol=false,
+ marineDetectRange=2500,marineSearchRadius=1500,marineSearchSeconds=600,marineHeight=12,
+ marineHealthReserve=0.35,mirageStandOff=180}
 services.characterController=newCharacterController(player,services.Run)
-local colors={bg=Color3.fromRGB(11,16,27),card=Color3.fromRGB(22,30,47),accent=Color3.fromRGB(83,113,255),
-    text=Color3.fromRGB(239,244,255),muted=Color3.fromRGB(153,168,196),green=Color3.fromRGB(48,170,129)}
+local colors={bg=Color3.fromRGB(9,10,13),card=Color3.fromRGB(17,18,23),accent=Color3.fromRGB(239,43,65),
+    text=Color3.fromRGB(239,244,255),muted=Color3.fromRGB(151,153,165),green=Color3.fromRGB(239,43,65)}
 local links,closed,pages,tabButtons,toggleButtons={},false,{},{},{}
+local toggleWidgets={}
 local engine,adapter
 local history={}
 local function bind(signal,fn) local connection=signal:Connect(fn);table.insert(links,connection);return connection end
@@ -1814,7 +2082,7 @@ local function make(class,parent,props)
     object.Parent=parent;return object
 end
 local function corner(obj,radius) make("UICorner",obj,{CornerRadius=UDim.new(0,radius or 12)}) end
-local function stroke(obj) make("UIStroke",obj,{Color=Color3.fromRGB(54,67,98),Thickness=1,Transparency=0.35}) end
+local function stroke(obj) make("UIStroke",obj,{Color=Color3.fromRGB(125,30,42),Thickness=1,Transparency=0.15}) end
 local function label(parent,value,size,pos)
     return make("TextLabel",parent,{Text=value,Size=size,Position=pos or UDim2.new(),BackgroundTransparency=1,
         Font=Enum.Font.Gotham,TextSize=14,TextColor3=colors.text,TextWrapped=true,
@@ -1828,17 +2096,17 @@ end
 local gui=make("ScreenGui",playerGui,{Name="PolarisMobileDemo",ResetOnSpawn=false,DisplayOrder=40,
     ZIndexBehavior=Enum.ZIndexBehavior.Sibling})
 local cleanup=make("BindableEvent",gui,{Name="Cleanup"})
-local panel=make("Frame",gui,{Size=UDim2.new(0.93,0,0.89,0),Position=UDim2.fromScale(0.5,0.5),
+local panel=make("Frame",gui,{Name="PolarisPanel",Size=UDim2.new(0.92,0,0.90,0),Position=UDim2.fromScale(0.5,0.5),
     AnchorPoint=Vector2.new(0.5,0.5),BackgroundColor3=colors.bg,BorderSizePixel=0})
 corner(panel,18);stroke(panel)
 services.polarisGui=gui
-make("UISizeConstraint",panel,{MaxSize=Vector2.new(860,680)})
+make("UISizeConstraint",panel,{MaxSize=Vector2.new(980,740)})
 local banner=make("Frame",panel,{Size=UDim2.new(1,0,0,64),BackgroundColor3=colors.card,BorderSizePixel=0})
 corner(banner,18)
-make("UIGradient",banner,{Color=ColorSequence.new(colors.accent,colors.card),Rotation=15})
+make("Frame",banner,{Size=UDim2.new(1,-24,0,1),Position=UDim2.new(0,12,1,-1),BackgroundColor3=colors.accent,BorderSizePixel=0})
 local title=label(banner,"POLARIS",UDim2.new(1,-120,0,30),UDim2.new(0,18,0,7))
 title.TextSize=23;title.Font=Enum.Font.GothamBold
-local subtitle=label(banner,"v0.8.1  /  MOBILE + PC  /  EXPERIMENTAL",UDim2.new(1,-120,0,20),UDim2.new(0,18,0,37))
+local subtitle=label(banner,"v0.9  /  MOBILE + PC  /  EXPERIMENTAL",UDim2.new(1,-120,0,20),UDim2.new(0,18,0,37))
 subtitle.TextSize=11
 local minimize=button(banner,"—",UDim2.fromOffset(38,36),UDim2.new(1,-94,0,14))
 local close=button(banner,"×",UDim2.fromOffset(38,36),UDim2.new(1,-50,0,14))
@@ -1864,36 +2132,68 @@ bind(services.Input.InputChanged,function(input)
         panel.Position=UDim2.fromOffset(x,y)
     end
 end)
-local nav=make("ScrollingFrame",panel,{Size=UDim2.new(1,-24,0,43),Position=UDim2.new(0,12,0,73),
+local nav=make("ScrollingFrame",panel,{Name="PolarisNavigation",Size=UDim2.new(1,-24,0,43),Position=UDim2.new(0,12,0,73),
     BackgroundTransparency=1,BorderSizePixel=0,AutomaticCanvasSize=Enum.AutomaticSize.X,
     CanvasSize=UDim2.new(),ScrollBarThickness=2,ScrollingDirection=Enum.ScrollingDirection.X})
-make("UIListLayout",nav,{FillDirection=Enum.FillDirection.Horizontal,Padding=UDim.new(0,6),SortOrder=Enum.SortOrder.LayoutOrder})
+local navLayout=make("UIListLayout",nav,{FillDirection=Enum.FillDirection.Horizontal,Padding=UDim.new(0,6),SortOrder=Enum.SortOrder.LayoutOrder})
 local status=label(panel,"INITIALISATION",UDim2.new(1,-30,0,28),UDim2.new(0,15,0,122))
 status.TextSize=12;status.TextColor3=colors.muted
-local area=make("Frame",panel,{Size=UDim2.new(1,-24,1,-220),Position=UDim2.new(0,12,0,158),BackgroundTransparency=1})
-local footer=make("Frame",panel,{Size=UDim2.new(1,-24,0,46),Position=UDim2.new(0,12,1,-55),BackgroundTransparency=1})
+local area=make("Frame",panel,{Name="PolarisPages",Size=UDim2.new(1,-24,1,-220),Position=UDim2.new(0,12,0,158),BackgroundTransparency=1})
+local footer=make("Frame",panel,{Name="PolarisActions",Size=UDim2.new(1,-24,0,46),Position=UDim2.new(0,12,1,-55),BackgroundTransparency=1})
 local run=button(footer,"DEMARRER",UDim2.new(0.32,0,1,0));run.BackgroundColor3=colors.accent
 local pause=button(footer,"PAUSE",UDim2.new(0.32,0,1,0),UDim2.fromScale(0.34,0))
 local stop=button(footer,"TOUT ARRETER",UDim2.new(0.32,0,1,0),UDim2.fromScale(0.68,0))
 local orders={}
+local pageTitle=label(panel,"Accueil",UDim2.new(1,-30,0,30),UDim2.new(0,15,0,120))
+pageTitle.Font=Enum.Font.GothamBold;pageTitle.TextSize=24
 local function showPage(name)
+    pageTitle.Text=name
     for key,page in pairs(pages) do page.Visible=key==name end
-    for key,b in pairs(tabButtons) do b.BackgroundColor3=key==name and colors.accent or colors.card end
+    for key,b in pairs(tabButtons) do
+        b.BackgroundColor3=key==name and Color3.fromRGB(37,18,25) or colors.bg
+        b.TextColor3=key==name and colors.text or colors.muted
+        local line=b:FindFirstChild("SelectionLine");if line then line.Visible=key==name end
+    end
 end
-for index,name in ipairs({"Accueil","Farm","Fruits","Epees","Races","Boutique","Maitrise","Objets","Boss","Evenements","Reglages","Navigation","Invocations","Puzzles","Performance","Journal"}) do
+for index,name in ipairs({"Accueil","Farm","Fruits","Epees","Races","Boutique","Maitrise","Objets","Boss","Evenements","Reglages","Navigation","Invocations","Puzzles","Mer","Mirage","V4","Performance","Journal"}) do
     local page=make("ScrollingFrame",area,{Name=name,Size=UDim2.fromScale(1,1),BackgroundTransparency=1,
         BorderSizePixel=0,CanvasSize=UDim2.new(),AutomaticCanvasSize=Enum.AutomaticSize.Y,ScrollBarThickness=3,Visible=index==1})
     make("UIListLayout",page,{Padding=UDim.new(0,10),SortOrder=Enum.SortOrder.LayoutOrder})
     make("UIPadding",page,{PaddingRight=UDim.new(0,7),PaddingBottom=UDim.new(0,12)})
     pages[name],orders[name]=page,0
     local b=button(nav,name,UDim2.fromOffset(name=="Performance" and 130 or 104,36));b.LayoutOrder=index
+    b.TextXAlignment=Enum.TextXAlignment.Left;b.TextSize=13
+    make("UIPadding",b,{PaddingLeft=UDim.new(0,12)})
+    local line=make("Frame",b,{Name="SelectionLine",Size=UDim2.fromOffset(3,24),Position=UDim2.new(0,0,0.5,-12),BackgroundColor3=colors.accent,BorderSizePixel=0,Visible=index==1});corner(line,2)
     tabButtons[name]=b;bind(b.Activated,function() showPage(name) end)
 end
-showPage("Accueil")
+local function responsiveLayout()
+    local wide=panel.AbsoluteSize.X>=700
+    if wide then
+        nav.Position=UDim2.fromOffset(12,82);nav.Size=UDim2.new(0,172,1,-150)
+        nav.ScrollingDirection=Enum.ScrollingDirection.Y;nav.AutomaticCanvasSize=Enum.AutomaticSize.Y
+        navLayout.FillDirection=Enum.FillDirection.Vertical
+        pageTitle.Position=UDim2.fromOffset(204,82);pageTitle.Size=UDim2.new(1,-220,0,32)
+        status.Position=UDim2.fromOffset(204,119);status.Size=UDim2.new(1,-220,0,26)
+        area.Position=UDim2.fromOffset(204,153);area.Size=UDim2.new(1,-220,1,-216)
+        footer.Position=UDim2.new(0,204,1,-55);footer.Size=UDim2.new(1,-220,0,44)
+    else
+        nav.Position=UDim2.fromOffset(12,74);nav.Size=UDim2.new(1,-24,0,42)
+        nav.ScrollingDirection=Enum.ScrollingDirection.X;nav.AutomaticCanvasSize=Enum.AutomaticSize.X
+        navLayout.FillDirection=Enum.FillDirection.Horizontal
+        pageTitle.Position=UDim2.fromOffset(15,123);pageTitle.Size=UDim2.new(1,-30,0,30)
+        status.Position=UDim2.fromOffset(15,157);status.Size=UDim2.new(1,-30,0,25)
+        area.Position=UDim2.fromOffset(12,188);area.Size=UDim2.new(1,-24,1,-250)
+        footer.Position=UDim2.new(0,12,1,-55);footer.Size=UDim2.new(1,-24,0,44)
+    end
+    for _,b in pairs(tabButtons) do b.Size=wide and UDim2.fromOffset(168,36) or UDim2.fromOffset(112,36) end
+end
+bind(panel:GetPropertyChangedSignal("AbsoluteSize"),responsiveLayout)
+responsiveLayout();showPage("Accueil")
 local function row(page,textValue,isButton,height)
     orders[page]=orders[page]+1
     local obj
-    if isButton then obj=button(pages[page],textValue,UDim2.new(1,-2,0,height or 52))
+    if isButton then obj=button(pages[page],textValue,UDim2.new(1,-2,0,height or 64))
     else
         obj=label(pages[page],textValue,UDim2.new(1,-2,0,0))
         obj.AutomaticSize=Enum.AutomaticSize.Y
@@ -1932,7 +2232,8 @@ if supported then
         {"mastery","Auto Farm Mastery",25,0.2},{"item","Auto Farm Item",30,0.2},
         {"boss","Auto Boss",65,0.2},{"event","Auto Event",80,0.2},
         {"boat","Navigation maritime",55,0.2},{"race3","Race V3 / Arowe",75,0.2},
-        {"summon","Invocation autorisee",60,0.2},{"puzzle","Puzzle Saber / plaques",40,0.2}}) do
+        {"summon","Invocation autorisee",60,0.2},{"puzzle","Puzzle Saber / plaques",40,0.2},
+        {"marine","Auto Sea Beast",60,0.2},{"seafish","Auto Sea Fish",50,0.2},{"mirage","Auto recherche Mirage",85,0.2}}) do
         engine:add(table.unpack(entry))
     end
     status.Text="Pret / en pause"
@@ -1941,11 +2242,20 @@ else
     report("Les actions sont desactivees hors de Blox Fruits. Le menu et le mode graphique restent disponibles.")
 end
 local function toggle(page,id,labelValue)
-    local b=row(page,labelValue.."  [OFF]",true);toggleButtons[id]=b
+    local b=row(page,labelValue.."  [OFF]",true,76);toggleButtons[id]=b
+    b.TextXAlignment=Enum.TextXAlignment.Left;b.TextSize=12
+    make("UIPadding",b,{PaddingLeft=UDim.new(0,14),PaddingRight=UDim.new(0,76)})
+    local track=make("Frame",b,{Name="ToggleTrack_"..id,Size=UDim2.fromOffset(44,24),Position=UDim2.new(1,-60,0.5,-12),BackgroundColor3=Color3.fromRGB(37,38,46),BorderSizePixel=0});corner(track,12);stroke(track)
+    local thumb=make("Frame",track,{Size=UDim2.fromOffset(18,18),Position=UDim2.fromOffset(3,3),BackgroundColor3=colors.muted,BorderSizePixel=0});corner(thumb,9)
+    toggleWidgets[id]={track=track,thumb=thumb}
     b.Active=supported==true;b.AutoButtonColor=supported==true
     bind(b.Activated,function()
         if not engine then return end
         engine:enable(id,not engine.tasks[id].enabled)
+        local on=engine.tasks[id].enabled
+        track.BackgroundColor3=on and colors.accent or Color3.fromRGB(37,38,46)
+        thumb.BackgroundColor3=on and colors.text or colors.muted
+        thumb.Position=on and UDim2.fromOffset(23,3) or UDim2.fromOffset(3,3)
         report(engine.tasks[id].label..(engine.tasks[id].enabled and " active" or " desactive"))
     end)
 end
@@ -1957,8 +2267,8 @@ bind(bossButton.Activated,function()
 end)
 local weaponButton=row("Farm","Arme de combat : Melee",true)
 bind(weaponButton.Activated,function() config.weapon=config.weapon=="Melee" and "Sword" or "Melee";weaponButton.Text="Arme de combat : "..config.weapon end)
-local speedButton=row("Farm","Vitesse de deplacement : 140",true)
-bind(speedButton.Activated,function() config.speed=config.speed==140 and 80 or 140;speedButton.Text="Vitesse de deplacement : "..config.speed end)
+local speedButton=row("Farm","Vitesse de deplacement : 220",true)
+bind(speedButton.Activated,function() config.speed=config.speed==100 and 220 or config.speed==220 and 300 or 100;speedButton.Text="Vitesse de deplacement : "..config.speed end)
 row("Farm","DEPLACEMENTS AUTOMATIQUES : MODE FANTOME TOUJOURS ACTIF. Traverse les obstacles pendant le trajet ; restaure les collisions uniquement dans un espace libre.",false)
 local ghostButton=row("Farm","APPARENCE FANTOME LOCALE  [OFF]",true)
 bind(ghostButton.Activated,function()
@@ -2154,6 +2464,7 @@ textSetting("Reglages","gachaBudget","Budget Gacha de cette session (0 = bloque)
 textSetting("Reglages","gachaMaxPrice","Plafond estime par Gacha : doit couvrir le prix reel",500000,1,100000000)
 textSetting("Reglages","shopBudget","Budget boutique de cette session (0 = bloque)",0,0,1000000000)
 textSetting("Reglages","shopMaxPrice","Plafond estime par achat boutique",1200000,1,100000000)
+textSetting("Reglages","speed","Vitesse de vol reglable (studs/s)",220,80,320)
 textSetting("Reglages","exitRadius","Recherche d'une sortie libre : rayon maximal studs",10,2,12)
 textSetting("Reglages","excludeFruits","Fruits exclus (noms exacts separes par virgules)","",nil)
 row("Reglages","Les plafonds sont des estimations configurees, pas un devis serveur. Les budgets reservent ces montants a chaque demande envoyee, meme si elle est refusee. Pas d'achat automatique de Robux.",false)
@@ -2197,7 +2508,7 @@ textSetting("Navigation","boatTolerance","Rayon d'arrivee maritime",35,10,100)
 row("Navigation","Siege actuel ou bateau possede charge. Direction et acceleration normales ; aucun tween/fly du bateau, aucun achat automatique ni evenement maritime garanti. Destruction, interruption ou 20 s sans progression : arret des commandes.",false)
 toggle("Races","race3","RACE V3 / AROWE (PARTIEL)")
 textSetting("Races","race3Budget","Budget evolution V3 (0 bloque paiement)",0,0,1000000000)
-row("Races","Arowe : lecture/acceptation/paiement par dialogue visible. Human : boss; Rabbit : coffres charges; Cyborg : fruit porte. Shark : combat maritime manuel. Angel/Ghoul : epreuve PvP manuelle. Draco non implemente. La fin depend de la confirmation serveur.",false)
+row("Races","Arowe : lecture/acceptation/paiement par dialogue visible. Human : boss; Rabbit : coffres charges; Cyborg : fruit porte. Shark : skills sur Sea Beast charge, puis validation Arowe. Origine naturelle non deduite automatiquement. Angel/Ghoul : epreuve PvP manuelle. Draco non implemente. La fin depend de la confirmation serveur.",false)
 toggle("Invocations","summon","PREPARER UNE INVOCATION")
 choice("Invocations","summonTarget","Boss a invoquer",{"Soul Reaper","rip_indra True Form","Dough King","Darkbeard"})
 local rare=row("Invocations","Autoriser consommation de l'objet rare [OFF]",true)
@@ -2206,14 +2517,49 @@ row("Invocations","Implemente : Soul Reaper avec Hallow Essence possedee et aute
 toggle("Puzzles","puzzle","PUZZLE SABER : PLAQUES (PARTIEL)")
 row("Puzzles","Mer 1, niveau 200+. Lecture des 5 plaques et de la porte historique. Deux essais maximum par plaque ; verification du changement de couleur/porte. Torch, Cup, Relic, Yama, Tushita et CDK non implementes. Aucune porte ni collision de carte modifiee.",false)
 
+
+toggle("Mer","marine","AUTO SEA BEAST / SKILLS")
+toggle("Mer","seafish","AUTO SEA FISH : PIRANHA / FISH CREW / SHARK")
+textSetting("Mer","marineTargets","Cibles Auto Beast (Sea Beast,Terrorshark...)",config.marineTargets,nil)
+textSetting("Mer","marineTool","Nom exact de ton fruit/arme maritime",config.marineTool,nil)
+textSetting("Mer","marineDetectRange","Distance de detection (zones chargees)",2500,100,5000)
+textSetting("Mer","marineHeight","Hauteur de combat souhaitee (bornee a la portee)",12,2,20)
+textSetting("Mer","marineHealthReserve","Pause/retour bateau si sante sous cette fraction",0.35,0.2,0.8)
+local patrolButton=row("Mer","Patrouille bateau si aucune cible [OFF]",true)
+bind(patrolButton.Activated,function() config.marinePatrol=not config.marinePatrol;patrolButton.Text="Patrouille bateau ["..(config.marinePatrol and "ON" or "OFF").."]" end)
+textSetting("Mer","marineSearchRadius","Rayon de patrouille autour du depart",1500,250,5000)
+textSetting("Mer","marineSearchSeconds","Duree maximale de recherche sans cible (secondes)",600,60,3600)
+row("Mer","Choisir l'equipement et ses touches dans Maitrise. Detection une fois/seconde : Enemies/SeaBeasts charges, sante numerique requise. Skills uniquement ; aucun drop garanti. Combat et bateau ne sont jamais controles ensemble. Schemas de sante non reconnus : attente explicite.",false)
+toggle("Mirage","mirage","AUTO FIND / APPROCHE MIRAGE")
+textSetting("Mirage","mirageStandOff","Distance d'approche au centre de l'ile",180,80,500)
+row("Mirage","Detection de Map.MysticIsland ou Mirage Island chargee. Patrouille facultative depuis un bateau, approche avec commandes normales. Aucun spawn force, aucun scan d'iles non chargees. Resonance/Blue Gear ne sont pas simules.",false)
+local v4Info=row("V4","Verification des prerequis : non lancee",false)
+local v4Check=row("V4","Verifier les prerequis observables",true)
+bind(v4Check.Activated,function()
+ if not adapter then return end
+ local d=adapter.raceOverview(os.clock())
+ v4Info.Text="Race : "..d.race.." / marqueur V2 : "..tostring(d.v2).."\nV3 confirme par ce module : "..tostring(d.v3Confirmed)..
+  " / Mirror Fractal inventaire : "..(d.mirrorFractal==nil and "requete en attente; recliquer" or tostring(d.mirrorFractal))..
+  "\nMirage chargee : "..tostring(d.mirageLoaded).."\n"..d.v4
+end)
+row("V4","V4 hors Draco : V3, progression Sealed King / indra, Mirror Fractal, resonance lunaire sur Mirage, Blue Gear, levier, trials et horloge. Certaines etapes demandent plusieurs joueurs. Le script aide a chercher Mirage et lire l'inventaire ; trials et puzzles V4 automatiques NON IMPLEMENTES.",false)
+row("V4","Human : Strength ; Shark : Water ; Rabbit : Speed ; Angel : King ; Ghoul : Carnage ; Cyborg : Machine. Chaque trial a sa logique propre ; aucun trajet unique ne valide toutes les races. Draco suit sa propre chaine/Trial of Flames, non implementee.",false)
+row("Races","V2 hors Draco : module fleurs historique conserve, acces/argent verifies par Alchemist. Draco V2/V3/V4 : chaines specifiques non implementees. Aucune evolution annoncee uniquement parce que le personnage est arrive a un PNJ.",false)
+
 local function refresh()
     if not engine then return end
     local count=0
     for id,b in pairs(toggleButtons) do
         local entry=engine.tasks[id]
         local detail=adapter.taskStatus(id) or {}
+        local widget=toggleWidgets[id]
+        if widget then
+            widget.track.BackgroundColor3=entry.enabled and colors.accent or Color3.fromRGB(37,38,46)
+            widget.thumb.BackgroundColor3=entry.enabled and colors.text or colors.muted
+            widget.thumb.Position=entry.enabled and UDim2.fromOffset(23,3) or UDim2.fromOffset(3,3)
+        end
         local textValue=entry.label..(entry.enabled and "  [ON]" or "  [OFF]").."\n"..(entry.enabled and (detail.state or entry.state or "en attente") or entry.state or "desactivee").." : "..(entry.enabled and (detail.reason or "") or "")
-        if b.Text~=textValue then b.Text=textValue;b.BackgroundColor3=entry.enabled and colors.green or colors.card end
+        if b.Text~=textValue then b.Text=textValue;b.BackgroundColor3=colors.card end
         if entry.enabled then count=count+1 end
     end
     summary.Text=count.." option(s) active(s)  /  "..(engine.running and "EN MARCHE" or "EN PAUSE")
@@ -2226,7 +2572,7 @@ local function refresh()
         "\nQuete : "..d.quest.."   |   Appels : "..d.requests.."\nGacha : "..math.floor(d.gachaWait/60).." min   |   Boutique : "..d.shop..(d.shopBlocked and " (arretee)" or "")
     if d.blocked or d.movementBlocked then if engine.running then engine:pause() end;status.Text=d.blocked or d.movementBlocked end
 end
-report("Polaris v0.8.1 charge. Toutes les actions sont OFF.")
+report("Polaris v0.9 charge. Toutes les actions sont OFF.")
 refresh()
 task.spawn(function()
     local lastRefresh=0

@@ -1,4 +1,4 @@
--- POLARIS v0.9 | Client experimental, sans dependance distante.
+-- POLARIS v0.10 | Client experimental, sans dependance distante.
 -- Input: polaris_mobile(1).lua v0.5, SHA256 deae6e159f1269edb6bccd6175315a4c1bb2a7161f60e184ade9da970a527dab.
 -- Implemented: shared movement, bounded exits, exact property restoration,
 -- foreground scheduler, cancellable background queue, observable inventory checks.
@@ -12,6 +12,14 @@
 -- No universal server compatibility, zero-lag or undetected-execution guarantee.
 -- Purchases use configurable estimates, reserve and conservative session budgets.
 -- Existing race V2 chain retains its own evolution cost; do not enable without funds.
+-- v0.10: seven pages, compact/default size presets, direct legendary switch,
+-- close stops tasks/requests immediately; impossible wall exits retain only collision recovery.
+-- Additional sources inspected (no LICENSE in root; no implementation copied):
+-- https://github.com/DragonScripthub/BloxFruit_Script/blob/main/UINew.txt (window sizes/minimize)
+-- https://github.com/DragonScripthub/BloxFruit_Script/blob/main/BloxFruit%20Paid.lua (obfuscated; rejected)
+-- https://github.com/lattex6329/bloxfruits/blob/main/README.md (marketing; no implementation to reuse)
+-- https://github.com/Cuonghub/Script-BloxFruits-New/blob/main/CuongHub.txt (toggles, minify, competing tween loops)
+-- Cuong numeric LegendarySwordDealer calls mix status/purchase; not copied as a polling protocol.
 -- Sources inspected:
 -- https://github.com/Roblox/creator-docs/blob/main/content/en-us/reference/engine/classes/WorldRoot.yaml
 -- Roblox/creator-docs/LICENSE: CC BY 4.0. API semantics studied, no documentation text copied.
@@ -29,7 +37,7 @@
 -- Verified tests are reported in the delivered response; no live Delta/Roblox session available.
 local function newEngine(adapter,clock,publish)
     local self={running=false,closed=false,tasks={},sequence={},active=nil,steps=0,prefix="POLARIS : ",since=0}
-    local function status(message) if self.lastStatus~=message then self.lastStatus=message;publish(message) end end
+    local function status(message,severity) if severity or self.lastStatus~=message then self.lastStatus=message;publish(message,severity) end end
     local function invoke(name,...) return pcall(adapter[name],...) end
     function self:add(id,label,priority,interval,background)
         local e={id=id,label=label,priority=priority,interval=interval,background=background or false,
@@ -42,13 +50,13 @@ local function newEngine(adapter,clock,publish)
         local ok,result=invoke("suspend",previous.id,transfer)
         previous.state=previous.enabled and "suspendue" or "desactivee"
         if not ok or result==false then
-            self.running=false;previous.state="erreur";status("Arret impossible : "..tostring(result));return false
+            self.running=false;previous.state="erreur";status("Arret impossible : "..tostring(result),"erreur");return false
         end
         return true
     end
     function self:enable(id,value)
         local e=assert(self.tasks[id],id)
-        e.enabled=value;e.failures=0;e.nextAt=0;e.state=value and "en attente" or "desactivee"
+        e.enabled=value;e.failures=0;e.nextAt=0;e.reason="";e.state=value and "en attente" or "desactivee"
         if adapter.setEnabled then adapter.setEnabled(id,value) end
         if not value and self.active==e then self:release(false) end
     end
@@ -65,9 +73,10 @@ local function newEngine(adapter,clock,publish)
             if adapter.recover and not adapter.recover() then status("Pause : sortie libre requise") else status("Pause") end
         end
     end
-    function self:close()
+    function self:close(force)
         self:pause()
-        if adapter.canClose and not adapter.canClose() then return false end
+        if not force and adapter.canClose and not adapter.canClose() then return false end
+        for _,e in ipairs(self.sequence) do if e.enabled then self:enable(e.id,false) end end
         self.closed=true;return true
     end
     function self:fail(e,reason)
@@ -77,7 +86,7 @@ local function newEngine(adapter,clock,publish)
         if adapter.setEnabled then adapter.setEnabled(e.id,false) end
         if self.active==e then self:release(false) end
         e.state="erreur"
-        status(e.label.." : "..e.reason)
+        status(e.label.." : "..e.reason,"erreur")
     end
     function self:runStep(e,now)
         local ok,done=invoke("step",e.id,now)
@@ -114,7 +123,7 @@ local function newEngine(adapter,clock,publish)
             if not self:release(selected~=nil) then return end
             self.active=selected;self.since=now
         end
-        if selected then self:runStep(selected,now);status(self.prefix..selected.label)
+        if selected then self:runStep(selected,now);if selected.state~="erreur" then status(self.prefix..selected.label) end
         else status("En attente / aucune cible disponible") end
     end
     return self
@@ -484,10 +493,60 @@ local function newMovement(player,services,config,report,clock)
         self.tween=services.TweenService:Create(r,TweenInfo.new(math.max(0.15,distance/speed),Enum.EasingStyle.Linear),{CFrame=goal})
         self.tween:Play();return false
     end
-    function self:close()
+    function self:close(force)
         if self.closed then return true end
-        if not self:stop() then return false end
-        self.closed=true;return true
+        local safe
+        if force then local ok,value=pcall(self.stop,self);safe=ok and value else safe=self:stop() end
+        if not safe and not force then return false end
+        self.closed=true
+        if safe then return true end
+        -- The UI and all tasks close immediately. Only collision recovery survives
+        -- an impossible exit; no target selection, attacks, requests or tween remain.
+        cancel();self.goal=nil;self.raw=nil;self.deferred=true
+        controller:setGhost(false)
+        local oldCharacter=player.Character
+        local root=oldCharacter and oldCharacter:FindFirstChild("HumanoidRootPart")
+        local token=Instance.new("BindableEvent");token.Name="PolarisSafetyCleanup"
+        token:SetAttribute("PolarisBlocked",true);token.Parent=player:FindFirstChild("PlayerGui")
+        local cleanupLinks={};local finished,busy=false,false
+        local function finish()
+            if finished then return end
+            finished=true;self.deferred=false
+            for _,link in ipairs(cleanupLinks) do link:Disconnect() end
+            controller:close();token:SetAttribute("PolarisBlocked",false);token:Destroy()
+        end
+        local function recover(explicit)
+            if finished or busy then return end
+            if player.Character~=oldCharacter or not root or not root.Parent then finish();return end
+            local h=oldCharacter:FindFirstChildOfClass("Humanoid")
+            if not h or h.Health<=0 then finish();return end
+            busy=true
+            local ok,result=pcall(function()
+                if not explicit and not self:free(root.CFrame) then return false end
+                return self:stop(true)
+            end)
+            busy=false
+            if ok and result then finish() end
+        end
+        cleanupLinks[#cleanupLinks+1]=token.Event:Connect(function() recover(true) end)
+        cleanupLinks[#cleanupLinks+1]=player.CharacterRemoving:Connect(function(c) if c==oldCharacter then finish() end end)
+        if root then
+            local lastCheck=-math.huge
+            cleanupLinks[#cleanupLinks+1]=root:GetPropertyChangedSignal("CFrame"):Connect(function()
+                local now=clock();if now-lastCheck>=1 then lastCheck=now;recover(false) end
+            end)
+            cleanupLinks[#cleanupLinks+1]=root.Destroying:Connect(finish)
+        end
+        local began,lastPoll=clock(),-math.huge
+        local probe
+        probe=services.Run.PreSimulation:Connect(function()
+            local now=clock()
+            if now-began>=10 then probe:Disconnect();return end
+            if now-lastPoll>=.5 then lastPoll=now;recover(false) end
+        end)
+        cleanupLinks[#cleanupLinks+1]=probe
+        warn("[Polaris] Menu ferme et actions arretees. Aucune sortie libre proche : protection des collisions conservee jusqu'a une position libre ou au respawn. Aucun trajet ne continue.")
+        return true
     end
     return self
 end
@@ -1290,9 +1349,10 @@ local function newAdapter(player,remote,services,config,report)
         end
         return true
     end
-    function adapter.close()
+    function adapter.cleanupDeferred() return movement.deferred==true end
+    function adapter.close(force)
         if closed then return true end
-        if not movement:close() then return false end
+        if not movement:close(force) then return false end
         closed=true;transport:close();groundConnection:Disconnect();return true
     end
     -- Own implementation: normal input and visible dialogue, no guessed game remotes.
@@ -1395,7 +1455,8 @@ local function newAdapter(player,remote,services,config,report)
         local pos=positionOf(npc)
         if not pos then error("PNJ sans position exploitable : "..name) end
         if not moveTo(pos*CFrame.new(0,0,3),3) then state(id,"en deplacement",name);return false end
-        local item=interactions[id] or {attempts=0,at=-math.huge};interactions[id]=item
+        local item=interactions[id]
+        if not item or item.npc~=npc then item={npc=npc,attempts=0,at=-math.huge};interactions[id]=item end
         if now-item.at<5 then return false end
         if item.attempts>=2 then error("Dialogue "..name.." non ouvert apres deux essais; interaction a verifier") end
         item.attempts=item.attempts+1;item.at=now
@@ -1414,12 +1475,34 @@ local function newAdapter(player,remote,services,config,report)
         raw=raw:gsub("[,%. ]","");local n=tonumber(raw)
         if n and n>0 then return n end
     end
+    -- Accept known historical/current labels only when they are observed in UI/inventory.
+    local legendaryNames={Saddi={"Saddi","Saishi"},Shisui={"Shisui","Shizu"},Wando={"Wando","Oroshi"}}
+    local function legendaryCount(name)
+        local total=0
+        for _,alias in ipairs(legendaryNames[name]) do
+            local n=count(alias);if n==nil then return nil end
+            total=math.max(total,n)
+        end
+        return total
+    end
+    local function offeredSword(text)
+        local match
+        text=text:lower()
+        for name,aliases in pairs(legendaryNames) do
+            local found=false
+            for _,alias in ipairs(aliases) do
+                if text:find("%f[%a]"..alias:lower().."%f[%A]") then found=true end
+            end
+            if found then if match then return nil end;match=name end
+        end
+        return match
+    end
     local legendaryPending,legendarySpent,legendaryAt=nil,0,0
     local legendaryBlocked=false
     local function legendary(now)
         requestInventory(now)
         if legendaryPending then
-            local s=legendaryPending;local n=count(s.name)
+            local s=legendaryPending;local n=legendaryCount(s.name)
             if inventoryAt>s.at and n and n>0 then
                 state("sword","en attente","Possession confirmee : "..s.name);legendaryPending=nil
                 legendaryAt=now+15;return true
@@ -1432,23 +1515,24 @@ local function newAdapter(player,remote,services,config,report)
         for rawName in (config.legendaryTargets or "Saddi,Shisui,Wando"):gmatch("[^,]+") do
             local name=rawName:match("^%s*(.-)%s*$")
             if name~="Saddi" and name~="Shisui" and name~="Wando" then error("Selection legendaire invalide : "..name) end
-            local n=count(name);if n==nil then state("sword","en attente","Inventaire serveur requis");return true end
+            local n=legendaryCount(name);if n==nil then state("sword","en attente","Inventaire serveur requis");return true end
             if n==0 then wanted[name]=true;missing=true end
         end
         if not missing then state("sword","terminee","Toutes les epees selectionnees sont possedees");return true end
         if now<legendaryAt then return true end
-        local dialog=findDialog(now,{"legendary sword dealer","saddi","shisui","wando"})
+        local dialog=findDialog(now,{"legendary sword dealer","saddi","shisui","wando","saishi","shizu","oroshi"})
         if not dialog then return interactNpc("Legendary Sword Dealer","sword",now) end
-        local offered
-        for name in pairs(wanted) do if dialog.text:lower():find(name:lower(),1,true) then offered=name;break end end
+        interactions.sword=nil
         local buy=actionButton(dialog,{"buy","purchase","acheter"})
-        if not offered or not buy then state("sword","en attente","Dialogue sans offre selectionnee ou achat explicite");legendaryAt=now+10;return true end
+        local offered=buy and (offeredSword(buy.Text) or offeredSword(dialog.text))
+        if not offered or not buy then state("sword","en attente","Offre absente/ambigue ou achat explicite indisponible");legendaryAt=now+10;return true end
+        if not wanted[offered] then state("sword","en attente","Epee proposee deja possedee; attente d'une offre manquante");legendaryAt=now+15;return true end
         local context=dialog.text.." "..buy.Text
         if context:lower():find("robux",1,true) or context:find("R$",1,true) or context:find(utf8.char(0xE002),1,true) then error("Robux dans le dialogue : aucun achat automatique") end
         local price=beliPrice(buy.Text) or beliPrice(dialog.text)
         if not price then error("Prix Beli absent/ambigu ou Robux; achat bloque") end
         if price>config.legendaryMaxPrice or legendarySpent+price>config.legendaryBudget or wallet()-price<config.reserve then
-            state("sword","en attente","Budget legendaire / prix maximal / reserve insuffisants");return true
+            state("sword","en attente","Beli insuffisants, reserve ou plafond interne atteint");legendaryAt=now+15;return true
         end
         legendarySpent=legendarySpent+price
         legendaryPending={name=offered,at=now};inventoryNext=0
@@ -1754,14 +1838,14 @@ local function newAdapter(player,remote,services,config,report)
             if legendaryPending or legendaryBlocked then return true end
             if now<legendaryAt then return false end
             requestInventory(now)
-            if count("Saddi")==nil then state(id,"en attente","Inventaire serveur requis");return false end
+            if legendaryCount("Saddi")==nil then state(id,"en attente","Inventaire serveur requis");return false end
             local missing=false
             for rawName in (config.legendaryTargets or "Saddi,Shisui,Wando"):gmatch("[^,]+") do
-                local name=rawName:match("^%s*(.-)%s*$");if count(name)==0 then missing=true end
+                local name=rawName:match("^%s*(.-)%s*$");if legendaryCount(name)==0 then missing=true end
             end
             if not missing then return true end
             if config.legendaryBudget<=0 then state(id,"en attente","Configurer le budget legendaire pour autoriser un achat");return false end
-            if findDialog(now,{"legendary sword dealer","saddi","shisui","wando"}) then return true end
+            if findDialog(now,{"legendary sword dealer","saddi","shisui","wando","saishi","shizu","oroshi"}) then return true end
             local folder=workspace:FindFirstChild("NPCs")
             if folder and folder:FindFirstChild("Legendary Sword Dealer") then return true end
             state(id,"en attente","Marchand non charge; les autres options peuvent continuer");return false
@@ -1786,7 +1870,7 @@ local function newAdapter(player,remote,services,config,report)
         end
         return advancedSuspend(id,transfer)
     end
-    function adapter.close() releaseInput();boatStop();return advancedClose() end
+    function adapter.close(force) releaseInput();pulseKey=nil;boatStop();return advancedClose(force) end
     local advancedDiagnostics=adapter.diagnostics
     function adapter.diagnostics()
         local d=advancedDiagnostics();d.legendarySpent=legendarySpent;d.race3=v3.stage;d.boat=boatSeat and boatSeat.Name or "--";return d
@@ -2039,7 +2123,7 @@ local function newAdapter(player,remote,services,config,report)
         end
         return baseSuspend(id,transfer)
     end
-    function adapter.close() restoreMirageRoute();return baseClose() end
+    function adapter.close(force) restoreMirageRoute();return baseClose(force) end
     function adapter.raceOverview(now)
         requestInventory(now)
         local data=player:FindFirstChild("Data");local race=data and data:FindFirstChild("Race")
@@ -2047,6 +2131,27 @@ local function newAdapter(player,remote,services,config,report)
             v3Confirmed=statuses.race3 and statuses.race3.state=="terminee" or false,
             mirrorFractal=count("Mirror Fractal"),mirageLoaded=mirageObject()~=nil,
             v4="Trials, resonance, levier et horloge non implementes"}
+    end
+
+    -- Loading/respawn is a waiting state, not a task failure.
+    local loadedReady=adapter.ready
+    function adapter.ready(id,now)
+        if closed then return false end
+        local data=player:FindFirstChild("Data")
+        local level=data and data:FindFirstChild("Level")
+        if not level or type(level.Value)~="number" then
+            state(id,"en attente","Chargement des donnees du joueur")
+            return false
+        end
+        if not character() then
+            state(id,"en attente","Personnage indisponible / respawn")
+            return false
+        end
+        if (id=="farm" or id=="quest") and not questUI() then
+            state(id,"en attente","Chargement de Main/Quest ; aucun appel de quete envoye")
+            return false
+        end
+        return loadedReady(id,now)
     end
 
     return adapter
@@ -2060,10 +2165,16 @@ assert(player,"Polaris doit etre execute cote client")
 local playerGui=player:WaitForChild("PlayerGui")
 local old=playerGui:FindFirstChild("PolarisMobileDemo")
 if old then local event=old:FindFirstChild("Cleanup");if event then event:Fire() end;assert(not old:GetAttribute("PolarisBlocked"),"Ancien trajet bloque : liberer une sortie avant de remplacer Polaris");old:Destroy() end
+-- Old UI cleanup can create a safety token; check AFTER it has stopped.
+local pendingCleanup=playerGui:FindFirstChild("PolarisSafetyCleanup")
+if pendingCleanup then
+    pendingCleanup:Fire()
+    assert(not pendingCleanup:GetAttribute("PolarisBlocked"),"Ancien arret dans un obstacle : rejoindre un espace libre ou respawn avant de reexecuter Polaris")
+end
 local config={bosses=true,weapon="Melee",speed=220,fruitRange=5000,phaseFlight=true,exitRadius=10,
  reserve=100000,gachaBudget=0,gachaMaxPrice=500000,shopBudget=0,shopMaxPrice=1200000,excludeFruits="",
  masteryTool="",masteryGoal=300,masteryThreshold=0.25,itemQuantity=10,replaceQuest=false,
- legendaryTargets="Saddi,Shisui,Wando",legendaryBudget=0,legendaryMaxPrice=2000000,
+ legendaryTargets="Saddi,Shisui,Wando",legendaryBudget=6000000,legendaryMaxPrice=2000000,
  skillKeys="Z,X",skillInterval=6,skillHold=0.15,skillRange=30,skillAim=true,
  boatTolerance=35,race3Budget=0,allowRare=false,summonTarget="Soul Reaper",puzzleTarget="Saber plates",marineTargets="Sea Beast",marineTool="",marinePatrol=false,
  marineDetectRange=2500,marineSearchRadius=1500,marineSearchSeconds=600,marineHeight=12,
@@ -2096,18 +2207,30 @@ end
 local gui=make("ScreenGui",playerGui,{Name="PolarisMobileDemo",ResetOnSpawn=false,DisplayOrder=40,
     ZIndexBehavior=Enum.ZIndexBehavior.Sibling})
 local cleanup=make("BindableEvent",gui,{Name="Cleanup"})
-local panel=make("Frame",gui,{Name="PolarisPanel",Size=UDim2.new(0.92,0,0.90,0),Position=UDim2.fromScale(0.5,0.5),
+local panel=make("Frame",gui,{Name="PolarisPanel",Size=UDim2.new(0.78,0,0.80,0),Position=UDim2.fromScale(0.5,0.5),
     AnchorPoint=Vector2.new(0.5,0.5),BackgroundColor3=colors.bg,BorderSizePixel=0})
 corner(panel,18);stroke(panel)
 services.polarisGui=gui
-make("UISizeConstraint",panel,{MaxSize=Vector2.new(980,740)})
+local panelLimit=make("UISizeConstraint",panel,{MaxSize=Vector2.new(660,500)})
 local banner=make("Frame",panel,{Size=UDim2.new(1,0,0,64),BackgroundColor3=colors.card,BorderSizePixel=0})
 corner(banner,18)
 make("Frame",banner,{Size=UDim2.new(1,-24,0,1),Position=UDim2.new(0,12,1,-1),BackgroundColor3=colors.accent,BorderSizePixel=0})
-local title=label(banner,"POLARIS",UDim2.new(1,-120,0,30),UDim2.new(0,18,0,7))
+local title=label(banner,"POLARIS",UDim2.new(1,-230,0,30),UDim2.new(0,18,0,7))
 title.TextSize=23;title.Font=Enum.Font.GothamBold
-local subtitle=label(banner,"v0.9  /  MOBILE + PC  /  EXPERIMENTAL",UDim2.new(1,-120,0,20),UDim2.new(0,18,0,37))
+local subtitle=label(banner,"v0.10  /  MOBILE + PC  /  EXPERIMENTAL",UDim2.new(1,-230,0,20),UDim2.new(0,18,0,37))
 subtitle.TextSize=11
+local sizeButton=button(banner,"PETIT",UDim2.fromOffset(84,36),UDim2.new(1,-184,0,14))
+sizeButton.TextSize=11
+local sizePresets={{label="PETIT",x=.78,y=.80,w=660,h=500},{label="NORMAL",x=.90,y=.88,w=840,h=640},{label="GRAND",x=.96,y=.94,w=980,h=740}}
+local sizeIndex=1
+bind(sizeButton.Activated,function()
+    sizeIndex=sizeIndex%#sizePresets+1
+    local preset=sizePresets[sizeIndex]
+    panel.Size=UDim2.new(preset.x,0,preset.y,0)
+    panelLimit.MaxSize=Vector2.new(preset.w,preset.h)
+    panel.Position=UDim2.fromScale(.5,.5)
+    sizeButton.Text=preset.label
+end)
 local minimize=button(banner,"—",UDim2.fromOffset(38,36),UDim2.new(1,-94,0,14))
 local close=button(banner,"×",UDim2.fromOffset(38,36),UDim2.new(1,-50,0,14))
 local reopen=button(gui,"POLARIS",UDim2.fromOffset(110,42),UDim2.new(0,12,0.45,0));reopen.Visible=false
@@ -2139,14 +2262,13 @@ local navLayout=make("UIListLayout",nav,{FillDirection=Enum.FillDirection.Horizo
 local status=label(panel,"INITIALISATION",UDim2.new(1,-30,0,28),UDim2.new(0,15,0,122))
 status.TextSize=12;status.TextColor3=colors.muted
 local area=make("Frame",panel,{Name="PolarisPages",Size=UDim2.new(1,-24,1,-220),Position=UDim2.new(0,12,0,158),BackgroundTransparency=1})
-local footer=make("Frame",panel,{Name="PolarisActions",Size=UDim2.new(1,-24,0,46),Position=UDim2.new(0,12,1,-55),BackgroundTransparency=1})
-local run=button(footer,"DEMARRER",UDim2.new(0.32,0,1,0));run.BackgroundColor3=colors.accent
-local pause=button(footer,"PAUSE",UDim2.new(0.32,0,1,0),UDim2.fromScale(0.34,0))
-local stop=button(footer,"TOUT ARRETER",UDim2.new(0.32,0,1,0),UDim2.fromScale(0.68,0))
 local orders={}
 local pageTitle=label(panel,"Accueil",UDim2.new(1,-30,0,30),UDim2.new(0,15,0,120))
 pageTitle.Font=Enum.Font.GothamBold;pageTitle.TextSize=24
+local pageGroups={Epees="Equipement",Boutique="Equipement",Maitrise="Farm",Objets="Farm",Boss="Farm",Evenements="Farm",Invocations="Farm",Puzzles="Races",V4="Races",Navigation="Mer",Mirage="Mer",Performance="Reglages",Journal="Reglages"}
+local function group(page) return pageGroups[page] or page end
 local function showPage(name)
+    name=group(name)
     pageTitle.Text=name
     for key,page in pairs(pages) do page.Visible=key==name end
     for key,b in pairs(tabButtons) do
@@ -2155,7 +2277,7 @@ local function showPage(name)
         local line=b:FindFirstChild("SelectionLine");if line then line.Visible=key==name end
     end
 end
-for index,name in ipairs({"Accueil","Farm","Fruits","Epees","Races","Boutique","Maitrise","Objets","Boss","Evenements","Reglages","Navigation","Invocations","Puzzles","Mer","Mirage","V4","Performance","Journal"}) do
+for index,name in ipairs({"Accueil","Farm","Fruits","Equipement","Mer","Races","Reglages"}) do
     local page=make("ScrollingFrame",area,{Name=name,Size=UDim2.fromScale(1,1),BackgroundTransparency=1,
         BorderSizePixel=0,CanvasSize=UDim2.new(),AutomaticCanvasSize=Enum.AutomaticSize.Y,ScrollBarThickness=3,Visible=index==1})
     make("UIListLayout",page,{Padding=UDim.new(0,10),SortOrder=Enum.SortOrder.LayoutOrder})
@@ -2170,30 +2292,35 @@ end
 local function responsiveLayout()
     local wide=panel.AbsoluteSize.X>=700
     if wide then
-        nav.Position=UDim2.fromOffset(12,82);nav.Size=UDim2.new(0,172,1,-150)
+        nav.Position=UDim2.fromOffset(12,82);nav.Size=UDim2.new(0,172,1,-100)
         nav.ScrollingDirection=Enum.ScrollingDirection.Y;nav.AutomaticCanvasSize=Enum.AutomaticSize.Y
         navLayout.FillDirection=Enum.FillDirection.Vertical
         pageTitle.Position=UDim2.fromOffset(204,82);pageTitle.Size=UDim2.new(1,-220,0,32)
         status.Position=UDim2.fromOffset(204,119);status.Size=UDim2.new(1,-220,0,26)
-        area.Position=UDim2.fromOffset(204,153);area.Size=UDim2.new(1,-220,1,-216)
-        footer.Position=UDim2.new(0,204,1,-55);footer.Size=UDim2.new(1,-220,0,44)
+        area.Position=UDim2.fromOffset(204,153);area.Size=UDim2.new(1,-220,1,-164)
     else
         nav.Position=UDim2.fromOffset(12,74);nav.Size=UDim2.new(1,-24,0,42)
         nav.ScrollingDirection=Enum.ScrollingDirection.X;nav.AutomaticCanvasSize=Enum.AutomaticSize.X
         navLayout.FillDirection=Enum.FillDirection.Horizontal
-        pageTitle.Position=UDim2.fromOffset(15,123);pageTitle.Size=UDim2.new(1,-30,0,30)
-        status.Position=UDim2.fromOffset(15,157);status.Size=UDim2.new(1,-30,0,25)
-        area.Position=UDim2.fromOffset(12,188);area.Size=UDim2.new(1,-24,1,-250)
-        footer.Position=UDim2.new(0,12,1,-55);footer.Size=UDim2.new(1,-24,0,44)
+        pageTitle.Position=UDim2.fromOffset(15,118);pageTitle.Size=UDim2.new(1,-30,0,25)
+        status.Position=UDim2.fromOffset(15,146);status.Size=UDim2.new(1,-30,0,22)
+        area.Position=UDim2.fromOffset(12,172);area.Size=UDim2.new(1,-24,1,-182)
     end
     for _,b in pairs(tabButtons) do b.Size=wide and UDim2.fromOffset(168,36) or UDim2.fromOffset(112,36) end
 end
 bind(panel:GetPropertyChangedSignal("AbsoluteSize"),responsiveLayout)
 responsiveLayout();showPage("Accueil")
+local sectionAdded={}
 local function row(page,textValue,isButton,height)
+    local section=page;page=group(page)
+    if section~=page and not sectionAdded[section] then
+        sectionAdded[section]=true;orders[page]=orders[page]+1
+        local header=label(pages[page],string.upper(section),UDim2.new(1,-2,0,30))
+        header.TextSize=12;header.Font=Enum.Font.GothamBold;header.TextColor3=colors.accent;header.LayoutOrder=orders[page]
+    end
     orders[page]=orders[page]+1
     local obj
-    if isButton then obj=button(pages[page],textValue,UDim2.new(1,-2,0,height or 64))
+    if isButton then obj=button(pages[page],textValue,UDim2.new(1,-2,0,height or 54))
     else
         obj=label(pages[page],textValue,UDim2.new(1,-2,0,0))
         obj.AutomaticSize=Enum.AutomaticSize.Y
@@ -2202,7 +2329,7 @@ local function row(page,textValue,isButton,height)
     end
     obj.LayoutOrder=orders[page];return obj
 end
-local welcome=row("Accueil","Active une option puis DEMARRER. Les achats utilisent ton argent du jeu. Compatibilite des appels et du combat a tester dans Delta.",false)
+local welcome=row("Accueil","Chaque interrupteur lance ou arrete directement sa fonction. Les achats utilisent ton argent du jeu. Compatibilite des appels et du combat a tester dans Delta.",false)
 local summary=row("Accueil","",false)
 local stats=row("Accueil","",false)
 local action=row("Accueil","Derniere action: --",false)
@@ -2217,15 +2344,40 @@ local function report(message)
     while #history>25 do table.remove(history) end
     logLabel.Text=table.concat(history,"\n")
 end
-local remotes=game:GetService("ReplicatedStorage"):FindFirstChild("Remotes")
-local remote=remotes and remotes:FindFirstChild("CommF_")
-local supported=game.GameId==994732206 and remote and remote:IsA("RemoteFunction")
-if supported then
+local storage=game:GetService("ReplicatedStorage")
+local knownPlace=({[2753915549]=true,[4442272183]=true,[7449423635]=true})[game.PlaceId]
+local expectedGame=game.GameId==994732206 or knownPlace==true
+local supported=false
+local initializationDeadline=os.clock()+30
+local initializationFinished=false
+local priorityDefaults={collect=90,event=80,boss=65,quest=20,farm=10,mastery=25,item=30}
+local function initializeActions()
+    if initializationFinished or closed then return end
+    if not expectedGame then
+        initializationFinished=true
+        status.Text="Blox Fruits non detecte"
+        report("Actions indisponibles : ce jeu n'est pas Blox Fruits.")
+        return
+    end
+    local remotes=storage:FindFirstChild("Remotes")
+    local remote=remotes and remotes:FindFirstChild("CommF_")
+    if not remote or not remote:IsA("RemoteFunction") then
+        if os.clock()>=initializationDeadline then
+            initializationFinished=true
+            status.Text="Erreur : CommF_ absent apres 30 s"
+            report("Initialisation impossible : Remotes/CommF_ absent apres 30 s. Attendre le chargement du jeu puis reexecuter.")
+        else status.Text="Chargement du jeu / attente CommF_" end
+        return
+    end
+    initializationFinished=true
     adapter=newAdapter(player,remote,services,config,report)
-    engine=newEngine(adapter,os.clock,function(message) status.Text=message end)
+    engine=newEngine(adapter,os.clock,function(message,severity)
+        status.Text=message
+        if severity=="erreur" then report("Erreur : "..message) end
+    end)
     engine.prefix="POLARIS : "
     for _,entry in ipairs({{"fruit","Stocker les fruits portes",100,2,true},{"collect","Chercher les fruits au sol",90,2},
-        {"sword","Auto achat legendaire via dialogue",70,2},{"gacha","Random fruit / Gacha",60,2,true},
+        {"sword","Auto achat legendaire",70,2},{"gacha","Random fruit / Gacha",60,2,true},
         {"race2","Quete race V2 / fleurs",85,2},{"swordfarm","Farm cible pour epee",30,0.2},
         {"navigate","Aller au PNJ selectionne",110,0.2},
         {"shop","Acheter la liste de 18 objets",50,3,true},{"farm","Auto Farm Level",10,0.2},{"quest","Auto Quest",20,0.5},
@@ -2236,13 +2388,36 @@ if supported then
         {"marine","Auto Sea Beast",60,0.2},{"seafish","Auto Sea Fish",50,0.2},{"mirage","Auto recherche Mirage",85,0.2}}) do
         engine:add(table.unpack(entry))
     end
-    status.Text="Pret / en pause"
-else
-    status.Text="Blox Fruits / CommF_ non detecte"
-    report("Les actions sont desactivees hors de Blox Fruits. Le menu et le mode graphique restent disponibles.")
+    supported=true
+    for _,button in pairs(toggleButtons) do button.Active=true;button.AutoButtonColor=true end
+    status.Text="Pret / active une option"
+    report("Connexion au jeu prete. Active une option ; elle demarre directement.")
+end
+local function safeInitializeActions()
+    local ok,err=pcall(initializeActions)
+    if not ok then
+        initializationFinished=true;supported=false
+        status.Text="Erreur d'initialisation / voir Journal"
+        warn("[Polaris] Initialisation : "..tostring(err))
+        report("Erreur d'initialisation : "..tostring(err))
+    end
+end
+safeInitializeActions()
+local function anyOptionEnabled()
+    if not engine then return false end
+    for _,entry in ipairs(engine.sequence) do if entry.enabled then return true end end
+    return false
+end
+local function enableTask(id,value)
+    if not engine then return end
+    engine:enable(id,value)
+    if value then
+        if adapter.canClose() then engine:start()
+        else report("Option activee, mais sortie libre requise. Reglages > Retenter une sortie libre.") end
+    elseif not anyOptionEnabled() then engine:pause() end
 end
 local function toggle(page,id,labelValue)
-    local b=row(page,labelValue.."  [OFF]",true,76);toggleButtons[id]=b
+    local b=row(page,labelValue.."  [OFF]",true,70);toggleButtons[id]=b
     b.TextXAlignment=Enum.TextXAlignment.Left;b.TextSize=12
     make("UIPadding",b,{PaddingLeft=UDim.new(0,14),PaddingRight=UDim.new(0,76)})
     local track=make("Frame",b,{Name="ToggleTrack_"..id,Size=UDim2.fromOffset(44,24),Position=UDim2.new(1,-60,0.5,-12),BackgroundColor3=Color3.fromRGB(37,38,46),BorderSizePixel=0});corner(track,12);stroke(track)
@@ -2251,7 +2426,7 @@ local function toggle(page,id,labelValue)
     b.Active=supported==true;b.AutoButtonColor=supported==true
     bind(b.Activated,function()
         if not engine then return end
-        engine:enable(id,not engine.tasks[id].enabled)
+        enableTask(id,not engine.tasks[id].enabled)
         local on=engine.tasks[id].enabled
         track.BackgroundColor3=on and colors.accent or Color3.fromRGB(37,38,46)
         thumb.BackgroundColor3=on and colors.text or colors.muted
@@ -2290,13 +2465,9 @@ toggle("Boutique","sword","AUTO ACHAT EPEES LEGENDAIRES")
 toggle("Boutique","shop","ACHETER 18 OBJETS DE BOUTIQUE")
 row("Boutique","Liste : "..table.concat(STOCK,", ")..". Une reponse non reconnue arrete la liste. Cette fonction ne debloque pas les armes obtenues par quetes ou drops.",false)
 local retry=row("Boutique","Recommencer la liste d'achats",true)
-bind(retry.Activated,function() if adapter then adapter.resetShop();report("Liste remise au debut. Activer la boutique puis Demarrer.") end end)
-row("Boutique","Marchand legendaire : dialogue visible uniquement, nom selectionne et prix Beli explicite requis. Inventaire avant/apres, budget et reserve. Compatibilite du dialogue a verifier en jeu.",false)
+bind(retry.Activated,function() if adapter then adapter.resetShop();report("Liste remise au debut. Activer la boutique.") end end)
+row("Boutique","Un interrupteur pour Saddi, Shisui et Wando : acheter uniquement les epees manquantes en Sea 2. Prix Beli lu dans le dialogue, plafond interne 2 000 000 par epee et 6 000 000 au total. La reserve globale reste appliquee. Le marchand doit etre charge.",false)
 row("Epees","ACHATS ET DROPS : les boutons lancent une tentative ou un farm cible. Une epee de drop n'est jamais garantie en un clic.",false)
-local legendary=row("Epees","Activer achat auto : Saddi / Shisui / Wando",true)
-bind(legendary.Activated,function()
-    if engine then engine:enable("sword",not engine.tasks.sword.enabled);report("Option marchand legendaire modifiee. Appuyer sur Demarrer.") end
-end)
 row("Epees","Le marchand depend du serveur ; ce n'est pas un spawn reserve a la nuit. Aucun appel numerique de consultation/achat n'est devine. Le module utilise le dialogue du marchand charge. Aucun minuteur de spawn invente.",false)
 for _,entry in ipairs({{"Rengoku","Rengoku / farmer Snow Lurker pour Hidden Key",2},
     {"Thunder God","Pole (1st Form) / farmer Thunder God",1},{"Cyborg","Farm Cyborg / drops",1},
@@ -2308,8 +2479,8 @@ for _,entry in ipairs({{"Rengoku","Rengoku / farmer Snow Lurker pour Hidden Key"
         if not engine then return end
         if adapter.diagnostics().sea~=requiredSea then report("Cette cible demande la mer "..requiredSea);return end
         config.swordTarget=target
-        engine:enable("swordfarm",true)
-        report("Cible : "..target..". Appuyer sur Demarrer. Acces et prerequis a debloquer avant.")
+        enableTask("swordfarm",true)
+        report("Cible : "..target..". Lancement automatique. Acces et prerequis a debloquer avant.")
     end)
 end
 row("Epees","Saber, Tushita, Yama, Cursed Dual Katana, True Triple Katana, Shark Anchor et les autres chaines de quetes : modules complets indisponibles. Les 18 achats standards sont dans Boutique. Le combat normal peut echouer selon le serveur.",false)
@@ -2329,7 +2500,7 @@ bind(checkV3.Activated,function()
 end)
 local visitV3=row("Races","Aller a Arowe / aide V3",true)
 bind(visitV3.Activated,function()
-    if adapter and adapter.goToNpc({"Arowe","arowe","Wenlocktoad"}) then engine:enable("navigate",true);engine:start() end
+    if adapter and adapter.goToNpc({"Arowe","arowe","Wenlocktoad"}) then enableTask("navigate",true);engine:start() end
 end)
 row("Races","V3 : V2 deja debloquee, niveau 1000+, Don Swan et acces requis, 2 000 000 Beli. Le menu fournit le suivi et l'acces au PNJ charge. Les objectifs V3 ne sont pas automatisés dans cette version ; accepte et valide ta quete chez Arowe.",false)
 
@@ -2392,18 +2563,12 @@ bind(services.Run.RenderStepped,function()
 end)
 local clear=row("Journal","Effacer le journal",true)
 bind(clear.Activated,function() history={};logLabel.Text="Journal vide" end)
-bind(run.Activated,function() if engine then engine:start() end end)
-bind(pause.Activated,function() if engine then engine:pause() end end)
-bind(stop.Activated,function()
-    if engine then engine:pause();for _,entry in ipairs(engine.sequence) do engine:enable(entry.id,false) end end
-    report("Options arretees. Une requete deja envoyee peut encore terminer.")
-end)
 local function dispose()
     if closed then return end
-    if engine and engine:close()==false then gui:SetAttribute("PolarisBlocked",true);report("Fermeture suspendue : aucune sortie libre proche. Garder le menu pour recuperer.");return false end
-    if adapter and adapter.close()==false then gui:SetAttribute("PolarisBlocked",true);return false end
+    if engine then engine:close(true) end
+    if adapter then adapter.close(true) end
     gui:SetAttribute("PolarisBlocked",false)
-    services.characterController:close()
+    if not adapter or not adapter.cleanupDeferred() then services.characterController:close() end
     closed=true;graphicsEpoch=graphicsEpoch+1
     if lowGraphics then
         services.Lighting.GlobalShadows=oldShadows
@@ -2420,7 +2585,7 @@ bind(services.Input.InputBegan,function(input,processed)
 end)
 
 local function textSetting(page,key,titleValue,default,minValue,maxValue)
-    row(page,titleValue,false)
+    row(page,titleValue,false);page=group(page)
     local input=make("TextBox",pages[page],{Size=UDim2.new(1,-2,0,42),Text=tostring(default),ClearTextOnFocus=false,
         BackgroundColor3=colors.card,TextColor3=colors.text,TextSize=14,Font=Enum.Font.Gotham,BorderSizePixel=0})
     orders[page]=orders[page]+1;input.LayoutOrder=orders[page];corner(input)
@@ -2470,18 +2635,15 @@ textSetting("Reglages","excludeFruits","Fruits exclus (noms exacts separes par v
 row("Reglages","Les plafonds sont des estimations configurees, pas un devis serveur. Les budgets reservent ces montants a chaque demande envoyee, meme si elle est refusee. Pas d'achat automatique de Robux.",false)
 for _,id in ipairs({"collect","event","boss","quest","farm","mastery","item"}) do
     local key="priority_"..id
-    config[key]=engine and engine.tasks[id].priority or 10
+    config[key]=engine and engine.tasks[id].priority or priorityDefaults[id]
     textSetting("Reglages",key,"Priorite "..id,config[key],0,150)
 end
 local recover=row("Reglages","Retenter une sortie libre (une tentative bornee)",true)
-bind(recover.Activated,function() if adapter then local ok=adapter.recover(true);gui:SetAttribute("PolarisBlocked",not ok);report(ok and "Sortie libre confirmee" or "Aucune sortie libre proche ; deplacement suspendu") end end)
+bind(recover.Activated,function() if adapter then local ok=adapter.recover(true);if ok and anyOptionEnabled() then engine:start() end;gui:SetAttribute("PolarisBlocked",not ok);report(ok and "Sortie libre confirmee" or "Aucune sortie libre proche ; deplacement suspendu") end end)
 local resetStore=row("Fruits","Reessayer les fruits refuses au stockage",true)
 bind(resetStore.Activated,function() if adapter then adapter.resetStore();report("Refus remis a zero par l'utilisateur") end end)
 
 
-textSetting("Boutique","legendaryTargets","Epees souhaitees (Saddi,Shisui,Wando)",config.legendaryTargets,nil)
-textSetting("Boutique","legendaryBudget","Budget legendaire session (0 bloque)",0,0,1000000000)
-textSetting("Boutique","legendaryMaxPrice","Prix maximal Beli par epee",2000000,1,100000000)
 textSetting("Maitrise","skillKeys","Skills debloques (Z,X,C,V separes par virgules)",config.skillKeys,nil)
 textSetting("Maitrise","skillInterval","Delai entre commandes skills (respecte tes cooldowns)",6,1,120)
 textSetting("Maitrise","skillHold","Duree de maintien de touche en secondes",0.15,0.05,2)
@@ -2558,7 +2720,7 @@ local function refresh()
             widget.thumb.BackgroundColor3=entry.enabled and colors.text or colors.muted
             widget.thumb.Position=entry.enabled and UDim2.fromOffset(23,3) or UDim2.fromOffset(3,3)
         end
-        local textValue=entry.label..(entry.enabled and "  [ON]" or "  [OFF]").."\n"..(entry.enabled and (detail.state or entry.state or "en attente") or entry.state or "desactivee").." : "..(entry.enabled and (detail.reason or "") or "")
+        local textValue=entry.label..(entry.enabled and "  [ON]" or "  [OFF]").."\n"..(entry.enabled and (detail.state or entry.state or "en attente") or entry.state or "desactivee").." : "..(entry.enabled and (detail.reason or entry.reason or "") or entry.reason or "")
         if b.Text~=textValue then b.Text=textValue;b.BackgroundColor3=colors.card end
         if entry.enabled then count=count+1 end
     end
@@ -2572,17 +2734,18 @@ local function refresh()
         "\nQuete : "..d.quest.."   |   Appels : "..d.requests.."\nGacha : "..math.floor(d.gachaWait/60).." min   |   Boutique : "..d.shop..(d.shopBlocked and " (arretee)" or "")
     if d.blocked or d.movementBlocked then if engine.running then engine:pause() end;status.Text=d.blocked or d.movementBlocked end
 end
-report("Polaris v0.9 charge. Toutes les actions sont OFF.")
+report("Polaris v0.10 charge. Menu compact ; toutes les actions sont OFF.")
 refresh()
 task.spawn(function()
     local lastRefresh=0
     while not closed do
         local ok,err=pcall(function()
+            if not initializationFinished then safeInitializeActions() end
             if adapter then adapter.transport:poll();adapter.maintenance(os.clock(),engine and engine.running) end
             if engine then for _,id in ipairs({"collect","event","boss","quest","farm","mastery","item"}) do engine.tasks[id].priority=config["priority_"..id] end;engine:tick() end
             if os.clock()-lastRefresh>=1 then lastRefresh=os.clock();refresh() end
         end)
-        if not ok then if engine then engine:pause() end;report("Arret: "..tostring(err):sub(1,160)) end
+        if not ok then if engine then engine:pause() end;warn("[Polaris] "..tostring(err));report("Arret: "..tostring(err):sub(1,200)) end
         task.wait(0.2)
     end
 end)

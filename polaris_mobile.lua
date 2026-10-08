@@ -1,8 +1,8 @@
--- POLARIS v0.10 | Client experimental, sans dependance distante.
+-- POLARIS v0.16 | Client experimental, sans dependance distante.
 -- Input: polaris_mobile(1).lua v0.5, SHA256 deae6e159f1269edb6bccd6175315a4c1bb2a7161f60e184ade9da970a527dab.
 -- Implemented: shared movement, bounded exits, exact property restoration,
 -- foreground scheduler, cancellable background queue, observable inventory checks.
--- Partial: historical quest catalog, ordinary Tool:Activate combat, Sword/Melee mastery,
+-- Partial: historical quest catalog, normal M1 input combat (executor-dependent), Sword/Melee mastery,
 -- material sources, visible-fruit collection/storage, Gacha, existing V2 flower chain.
 -- Legendary purchases: visible NPC dialogue only, exact sword and displayed Beli price required.
 -- Experimental: normal-input skills, current-seat navigation, V3 assistance, Saber plates, Soul Reaper.
@@ -35,6 +35,18 @@
 -- https://bffr.fr/wiki/quetes/quests/ (changed zones blocked pending live quest IDs).
 -- https://bffr.fr/wiki/en/activites/events/ (metadata; no verified live-game catalog).
 -- Verified tests are reported in the delivered response; no live Delta/Roblox session available.
+-- v0.11: observed style purchases/training cycle to 600; manual equipment mode retained.
+-- Auto Quest no longer reports a step done while traveling; temporary idle support ignores water.
+-- Style sources: https://bffr.fr/wiki/en/styles/ (names/prerequisites, not proof of live API support).
+
+-- v0.12: bounded loaded-chest collector, rare-object pause, sticky loaded elite combat.
+-- Independent implementation; no code copied from the public examples.
+
+-- v0.13: compact UI text; explanations removed, controls/status/errors retained.
+
+-- v0.14: violet/cyan theme, event-driven tweens, touch feedback, animation cleanup.
+
+-- v0.16: owned-boat boarding/patrol, bounded boarding retries, sea-combat return and health recovery.
 local function newEngine(adapter,clock,publish)
     local self={running=false,closed=false,tasks={},sequence={},active=nil,steps=0,prefix="POLARIS : ",since=0}
     local function status(message,severity) if severity or self.lastStatus~=message then self.lastStatus=message;publish(message,severity) end end
@@ -242,6 +254,8 @@ local QUESTS = {
 -- Activity metadata; combat-present and preparation are intentionally distinct.
 local ALIASES={Bobby="Chef",Wysper="Sky Warlord",Fajita="Orbitus",["Island Empress"]="Hydra Leader"}
 local MATERIALS={
+    {name="Dragon Scale",sea=3,enemies={"Dragon Crew Warrior","Dragon Crew Archer"},loadedOnly=true},
+    {name="Demonic Wisp",sea=3,enemies={"Demonic Soul"}},
     {name="Angel Wings",sea=1,enemies={"Royal Soldier","Royal Squad"}},
     {name="Magma Ore",sea=1,enemies={"Military Soldier","Military Spy"}},
     {name="Fish Tail",sea=1,enemies={"Fishman Warrior","Fishman Commando"}},
@@ -303,9 +317,10 @@ for _,item in ipairs(MATERIALS) do
     item.acquisition="getInventory confirme la quantite cible"
 end
 local function newCharacterController(player,runService)
-    local self={ghost=false,flying=false,closed=false}
+    local self={ghost=false,flying=false,holding=false,closed=false}
     local current,parts,collision,visual=nil,{}, {},{}
     local flightLink,charLink,highlight,attachment,hover,autoRotate
+    local supportLink,supportAttachment,supportVelocity
     local function restore(values,key)
         for obj,value in pairs(values) do pcall(function() obj[key]=value end) end
         return {}
@@ -322,6 +337,24 @@ local function newCharacterController(player,runService)
             if self.flying then if collision[obj]==nil then collision[obj]=obj.CanCollide end;obj.CanCollide=false end
         end
     end
+    function self:setHover(value)
+        if supportLink then supportLink:Disconnect();supportLink=nil end
+        if supportVelocity then supportVelocity:Destroy();supportVelocity=nil end
+        if supportAttachment then supportAttachment:Destroy();supportAttachment=nil end
+        self.holding=false
+        if not value or self.closed or self.flying then return end
+        local root=current and current:FindFirstChild("HumanoidRootPart")
+        local h=current and current:FindFirstChildOfClass("Humanoid")
+        if not root or not h or h.Health<=0 or root.Anchored or h.SeatPart then return end
+        self.holding=true
+        supportAttachment=Instance.new("Attachment");supportAttachment.Name="PolarisWaitAttachment";supportAttachment.Parent=root
+        supportVelocity=Instance.new("LinearVelocity");supportVelocity.Name="PolarisWaitHover";supportVelocity.Attachment0=supportAttachment
+        supportVelocity.RelativeTo=Enum.ActuatorRelativeTo.World;supportVelocity.VectorVelocity=Vector3.zero
+        supportVelocity.ForceLimitsEnabled=false;supportVelocity.Parent=root
+        supportLink=runService.PreSimulation:Connect(function()
+            if root.Parent then root.AssemblyLinearVelocity=Vector3.zero;root.AssemblyAngularVelocity=Vector3.zero end
+        end)
+    end
     function self:setFlying(value)
         if self.closed then return end
         self.flying=value
@@ -334,6 +367,7 @@ local function newCharacterController(player,runService)
             if h and autoRotate~=nil then h.AutoRotate=autoRotate end
             autoRotate=nil;return
         end
+        self:setHover(false)
         if flightLink then return end
         local root=current and current:FindFirstChild("HumanoidRootPart")
         local h=current and current:FindFirstChildOfClass("Humanoid")
@@ -370,7 +404,7 @@ local function newCharacterController(player,runService)
         end
     end
     local function attach(c)
-        self:setFlying(false);visual=restore(visual,"LocalTransparencyModifier")
+        self:setHover(false);self:setFlying(false);visual=restore(visual,"LocalTransparencyModifier")
         if charLink then charLink:Disconnect() end
         if highlight then highlight:Destroy();highlight=nil end
         current=c;parts={}
@@ -382,7 +416,7 @@ local function newCharacterController(player,runService)
     attach(player.Character)
     function self:close()
         if self.closed then return end
-        self:setFlying(false);self:setGhost(false)
+        self:setHover(false);self:setFlying(false);self:setGhost(false)
         self.closed=true;if charLink then charLink:Disconnect() end;added:Disconnect();removed:Disconnect()
     end
     return self
@@ -438,6 +472,25 @@ local function newMovement(player,services,config,report,clock)
         -- Keep ghost/hover while the next task selects its destination.
         return true
     end
+    local supportAllowed,supportAt=true,0
+    local function hasGround(root)
+        local c,h=character()
+        if not c or not root or h.SeatPart then return true end
+        local params=RaycastParams.new();params.FilterType=Enum.RaycastFilterType.Exclude
+        params.FilterDescendantsInstances={c};params.IgnoreWater=true;params.RespectCanCollide=true
+        local hit=workspace:Raycast(root.Position,Vector3.new(0,-8,0),params)
+        return hit and hit.Material~=Enum.Material.Water and (hit.Instance:IsA("Terrain") or hit.Instance.CanCollide) or false
+    end
+    function self:setSupportAllowed(value)
+        supportAllowed=value
+        if not value then controller:setHover(false) end
+    end
+    function self:pollSupport(now)
+        if self.closed or not controller.holding or now<supportAt then return end
+        supportAt=now+.5
+        local _,_,root=character()
+        if not root or not supportAllowed or hasGround(root) then controller:setHover(false) end
+    end
     function self:stop(retry)
         if self.blocked and not retry then return false end
         cancel();self.goal=nil;self.raw=nil
@@ -451,6 +504,8 @@ local function newMovement(player,services,config,report,clock)
             r.CFrame=safe
         end
         controller:setFlying(false)
+        local hold=r and supportAllowed and not self.shuttingDown and not hasGround(r)
+        if hold~=controller.holding then controller:setHover(hold==true) end
         if r then r.AssemblyLinearVelocity=Vector3.zero;r.AssemblyAngularVelocity=Vector3.zero end
         if h then h:Move(Vector3.zero) end
         self.root=nil;self.blocked=nil;return true
@@ -466,6 +521,10 @@ local function newMovement(player,services,config,report,clock)
         end
         local now=clock()
         local speed=math.clamp(tonumber(config.speed) or 220,80,320)
+        -- Ignore target jitter around the existing goal; one flight retains ownership.
+        if self.tween and speed==speedUsed and self.root==r and self.raw and (self.raw.Position-cf.Position).Magnitude<8 and (r.Position-self.goal.Position).Magnitude>12 then
+            cf=self.raw
+        end
         if speed==speedUsed and self.root==r and self.raw and (self.raw.Position-cf.Position).Magnitude<4 then
             local remaining=(r.Position-self.goal.Position).Magnitude
             if remaining<=math.min(tolerance or 3,1.5) then
@@ -495,6 +554,7 @@ local function newMovement(player,services,config,report,clock)
     end
     function self:close(force)
         if self.closed then return true end
+        self.shuttingDown=true;controller:setHover(false)
         local safe
         if force then local ok,value=pcall(self.stop,self);safe=ok and value else safe=self:stop() end
         if not safe and not force then return false end
@@ -548,6 +608,123 @@ local function newMovement(player,services,config,report,clock)
         warn("[Polaris] Menu ferme et actions arretees. Aucune sortie libre proche : protection des collisions conservee jusqu'a une position libre ou au respawn. Aucun trajet ne continue.")
         return true
     end
+    return self
+end
+
+-- Normal M1 input only; no fabricated hit, damage or combat remotes.
+local function newCombatInput(player,config)
+    local self={target=nil,health=nil,lastDamage=0,lastHit=-math.huge,closed=false}
+    local mouseService,held,x,y
+    local orbitHumanoid,orbitAutoRotate,orbitTarget,orbitPosition,orbitProgress,orbitStopped
+    local orbitDirection=1
+    local function stopOrbit()
+        if orbitHumanoid then
+            pcall(function() orbitHumanoid:Move(Vector3.zero,false);orbitHumanoid.AutoRotate=orbitAutoRotate end)
+        end
+        orbitHumanoid=nil;orbitAutoRotate=nil
+    end
+    function self:orbit(target,c,h,root,er,now)
+        if not config.orbitCombat or h.Sit==true then stopOrbit();return "" end
+        if orbitTarget~=target then
+            stopOrbit();orbitTarget=target;orbitPosition=root.Position;orbitProgress=now;orbitStopped=nil
+        end
+        if orbitStopped then stopOrbit();return " / cercle arrete : progression refusee" end
+        if (root.Position-orbitPosition).Magnitude>0.5 then orbitPosition=root.Position;orbitProgress=now end
+        if orbitHumanoid and now-orbitProgress>6 then orbitStopped=true;stopOrbit();return " / cercle arrete : progression refusee" end
+        local offset=root.Position-er.Position;offset=Vector3.new(offset.X,0,offset.Z)
+        if offset.Magnitude<1 then stopOrbit();return " / trop proche pour tourner" end
+        local radial=offset.Unit
+        local params=RaycastParams.new();params.FilterType=Enum.RaycastFilterType.Exclude;params.FilterDescendantsInstances={c}
+        params.IgnoreWater=true;params.RespectCanCollide=true
+        local radius=math.clamp(tonumber(config.orbitRadius) or 4.5,3,5.5)
+        local function direction(sign)
+            local tangent=Vector3.new(-radial.Z,0,radial.X)*sign
+            local desired=tangent*6+radial*math.clamp((radius-offset.Magnitude)*2,-4,4)
+            local speed=math.min(tonumber(h.WalkSpeed) or 16,math.clamp(tonumber(config.orbitSpeed) or 10,3,18))
+            local step=desired.Unit*math.max(1.8,speed*0.3+0.8)
+            local blocked=workspace:Raycast(root.Position,step,params) or workspace:Raycast(root.Position+Vector3.new(0,-2,0),step,params)
+            local ground=workspace:Raycast(root.Position+step,Vector3.new(0,-8,0),params)
+            return not blocked and ground and desired.Unit or nil
+        end
+        local move=direction(orbitDirection)
+        if not move then move=direction(-orbitDirection);if move then orbitDirection=-orbitDirection end end
+        if not move then stopOrbit();orbitProgress=now;return " / cercle bloque : obstacle ou bord" end
+        if orbitHumanoid~=h then stopOrbit();orbitHumanoid=h;orbitAutoRotate=h.AutoRotate end
+        h.AutoRotate=false
+        local walk=tonumber(h.WalkSpeed) or 16
+        h:Move(move*math.clamp((tonumber(config.orbitSpeed) or 10)/math.max(1,walk),0.1,1),false)
+        return " / cercle actif"
+    end
+    local function visible(obj,pg)
+        while obj and obj~=pg do
+            if obj:IsA("GuiObject") and not obj.Visible then return false end
+            if obj:IsA("ScreenGui") and not obj.Enabled then return false end
+            obj=obj.Parent
+        end
+        return obj==pg
+    end
+    function self:release()
+        if held and mouseService then pcall(function() mouseService:SendMouseButtonEvent(x,y,0,false,game,0) end) end
+        held=false
+    end
+    function self:reset()
+        self:release();stopOrbit();orbitTarget=nil;orbitStopped=nil;self.target=nil;self.health=nil;self.lastHit=-math.huge
+    end
+    function self:attack(target,tool,now)
+        if self.closed then return false,"Combat ferme" end
+        local c=player.Character
+        local h=c and c:FindFirstChildOfClass("Humanoid")
+        local root=c and c:FindFirstChild("HumanoidRootPart")
+        local eh=target and target:FindFirstChildOfClass("Humanoid")
+        local er=target and target:FindFirstChild("HumanoidRootPart")
+        if not h or h.Health<=0 or not root or not eh or eh.Health<=0 or not er or not target.Parent then
+            self:reset();return false,"Cible ou personnage indisponible"
+        end
+        if not tool or tool.Parent~=c then self:reset();return false,"Equipement en attente" end
+        if h.Sit==true or (root.Position-er.Position).Magnitude>7 then self:reset();return false,"Hors portee du combat" end
+        local pg=player:FindFirstChild("PlayerGui")
+        local main=pg and pg:FindFirstChild("Main")
+        -- Never send an M1 into an open purchase/dialogue interface.
+        for _,obj in ipairs(main and main:GetChildren() or {}) do
+            if obj:IsA("GuiObject") and (obj.Name:lower():find("dialog",1,true) or obj.Name=="Shop") and visible(obj,pg) then
+                self:reset();return false,"Fermer le dialogue ou la boutique pour combattre"
+            end
+        end
+        if self.target~=target or self.health==nil then
+            self.target=target;self.health=eh.Health;self.lastDamage=now
+        elseif eh.Health<self.health then self.lastDamage=now end
+        self.health=eh.Health
+        if now-self.lastDamage>=12 then self:release();stopOrbit();error("Aucun degat observe depuis 12 s : verifier arme, portee et clic M1; combat arrete") end
+        local orbit=self:orbit(target,c,h,root,er,now)
+        if now-self.lastHit<0.55 then return true,"Attaque en recharge"..orbit end
+        self.lastHit=now
+        local camera=workspace.CurrentCamera
+        if not camera or not camera.ViewportSize then
+            local ok,err=pcall(function() tool:Activate() end)
+            if not ok then error("Activation de l'arme refusee : "..tostring(err)) end
+            return true,"Activation outil; camera indisponible"..orbit
+        end
+        if not mouseService then
+            local ok,value=pcall(function() return game:GetService("VirtualInputManager") end)
+            if ok then mouseService=value end
+        end
+        if not mouseService then error("Clic M1 indisponible dans cet executeur") end
+        x,y=math.floor(camera.ViewportSize.X/2),math.floor(camera.ViewportSize.Y/2)
+        local polaris=pg and pg:FindFirstChild("PolarisMobileDemo")
+        local enabled=polaris and polaris.Enabled
+        if polaris then polaris.Enabled=false end
+        local ok,err=pcall(function()
+            held=true
+            mouseService:SendMouseButtonEvent(x,y,0,true,game,0)
+            mouseService:SendMouseButtonEvent(x,y,0,false,game,0)
+            held=false
+        end)
+        self:release()
+        if polaris then polaris.Enabled=enabled end
+        if not ok then error("Clic M1 refuse : "..tostring(err)) end
+        return true,"Clic M1 / sante cible "..math.ceil(eh.Health)..orbit
+    end
+    function self:close() self:reset();self.closed=true end
     return self
 end
 
@@ -635,7 +812,7 @@ local function newAdapter(player,remote,services,config,report)
     local adapter={transport=transport}
     local closed=false
     local raceStage,racePoll,raceDone=nil,0,false
-    local lastAttack,questRetry,enemyScan=0,0,0
+    local combat,questRetry,enemyScan=newCombatInput(player,config),0,0
     local nextGacha,shopIndex,swordIndex=0,1,1
     local shopBlocked=false
     local storeTried,collectTried=setmetatable({},{__mode="k"}),setmetatable({},{__mode="k"})
@@ -654,7 +831,7 @@ local function newAdapter(player,remote,services,config,report)
         if h and r and h.Health>0 then return c,h,r end
     end
     local function stopMovement() return movement:stop() end
-    local function moveTo(cf,tolerance) return movement:moveTo(cf,tolerance) end
+    local function moveTo(cf,tolerance) combat:reset();return movement:moveTo(cf,tolerance) end
     local function isGround(tool)
         return tool:IsA("Tool") and tool.Name:find("Fruit",1,true) and tool:IsDescendantOf(workspace)
             and not (player.Character and tool:IsDescendantOf(player.Character))
@@ -736,10 +913,10 @@ local function newAdapter(player,remote,services,config,report)
     end
     local function fightNamed(name,spawn,now)
         local c,h,root=character()
-        if not c then stopMovement();return false end
+        if not c then combat:reset();stopMovement();return false end
         if h.Health/h.MaxHealth<0.25 then recovering=true end
         if recovering then
-            stopMovement();say("Pause sante: reprise a 65 %")
+            combat:reset();stopMovement();say("Pause sante: reprise a 65 %")
             if h.Health/h.MaxHealth>=0.65 then recovering=false end
             return false
         end
@@ -753,21 +930,22 @@ local function newAdapter(player,remote,services,config,report)
                 if d<distance then target,distance=model,d end
             end
         end
-        if not target then say("Attente de "..name);if spawn then moveTo(spawn,8) end;return false end
+        if not target then combat:reset();say("Attente de "..name);if spawn then moveTo(spawn,8) end;return false end
         local er=target.HumanoidRootPart
         -- Finish the shared ghost journey before switching to combat, even inside
         -- melee range. Distance alone must never restore collisions inside a wall.
         if movement.goal or distance>7 then
+            combat:reset()
             if not moveTo(er.CFrame*CFrame.new(0,1,4),3) then return false end
             distance=(root.Position-er.Position).Magnitude
             if distance>7 then say("Position libre hors portee; attente de la cible");return false end
         end
         if not stopMovement() then error(movement.blocked) end
         local tool=weapon(c,h)
-        if not tool then say("Aucune arme "..config.weapon.." disponible");return false end
+        if not tool then combat:reset();say("Aucune arme "..config.weapon.." disponible");return false end
         root.CFrame=CFrame.lookAt(root.Position,Vector3.new(er.Position.X,root.Position.Y,er.Position.Z))
-        if now-lastAttack>=0.55 then tool:Activate();lastAttack=now end
-        say("Combat: "..name.." / "..tool.Name)
+        local _,detail=combat:attack(target,tool,now)
+        say("Combat: "..name.." / "..tool.Name.." — "..detail)
         return false
     end
     local function hasItem(name)
@@ -899,10 +1077,10 @@ local function newAdapter(player,remote,services,config,report)
         end
         if not stopMovement() then error(movement.blocked) end
         local tool=weapon(c,h)
-        if not tool then say("Aucune arme "..config.weapon.." equipee/disponible");return false end
+        if not tool then combat:reset();say("Aucune arme "..config.weapon.." equipee/disponible");return false end
         root.CFrame=CFrame.lookAt(root.Position,Vector3.new(er.Position.X,root.Position.Y,er.Position.Z))
-        if now-lastAttack>=0.55 then tool:Activate();lastAttack=now end
-        say("Combat normal: "..activeQuest.name.." / "..tool.Name)
+        local _,detail=combat:attack(target,tool,now)
+        say("Combat normal: "..activeQuest.name.." / "..tool.Name.." — "..detail)
         return false
     end
     function adapter.ready(id,now)
@@ -1079,6 +1257,7 @@ local function newAdapter(player,remote,services,config,report)
     end
     function adapter.maintenance(now,allowRequests)
         if closed then return end
+        movement:pollSupport(now)
         if allowRequests~=false and (enabled.item or enabled.fruit or enabled.sword) then requestInventory(now) end
         if gachaVerify then
             local before=gachaVerify.before
@@ -1110,8 +1289,8 @@ local function newAdapter(player,remote,services,config,report)
         enabled[id]=value;transport:cancel(id)
         if value then state(id,"en attente","") else state(id,"desactivee","") end
     end
-    function adapter.pauseRequests() transport.paused=true;transport:cancel() end
-    function adapter.resumeRequests() transport.paused=false end
+    function adapter.pauseRequests() transport.paused=true;transport:cancel();movement:setSupportAllowed(false) end
+    function adapter.resumeRequests() transport.paused=false;movement:setSupportAllowed(true) end
     function adapter.taskStatus(id)
         local s=statuses[id] or {state="en attente",reason=""}
         if movement.goal and currentId==id and s.state~="erreur" then return {state="en deplacement",reason=s.reason} end
@@ -1227,6 +1406,10 @@ local function newAdapter(player,remote,services,config,report)
         for _,entry in ipairs(QUESTS) do
             if entry.sea==sea and entry.name==(chosen or objective.enemies[1]) then q=entry;break end
         end
+        if objective.loadedOnly then
+            if not chosen then combat:reset();state("item","en attente","Source non chargee : "..objective.enemies[1]);return true end
+            return fightNamed(chosen,nil,now)
+        end
         if not q then error("Source sans destination validee") end
         state("item","en combat",objective.name.." : "..n.." / "..config.itemQuantity.." ; aucun drop garanti")
         return fightNamed(chosen or q.name,q.spawn,now)
@@ -1258,6 +1441,10 @@ local function newAdapter(player,remote,services,config,report)
             for _,name in ipairs(event.enemies) do if enemies[name] then return true end end
             state(id,"en attente","Evenement non detecte dans la zone chargee");return false
         end
+        if id=="item" and config.itemObjective and config.itemObjective.loadedOnly then
+            for _,name in ipairs(config.itemObjective.enemies) do if enemies[name] then return true end end
+            state(id,"en attente","Source non chargee : "..config.itemObjective.enemies[1]);return false
+        end
         if id=="mastery" or id=="item" then return true end
         if id=="quest" then local ui=questUI();return not ui or not ui.Visible end
         if id=="fruit" then return not storeVerify and not transport:has(id) and carriedFruit(now)~=nil end
@@ -1276,7 +1463,7 @@ local function newAdapter(player,remote,services,config,report)
         if id=="item" then return itemFarm(now) end
         if id=="boss" then return bossFarm(now) end
         if id=="event" then return eventFarm(now) end
-        if id=="quest" then ensureQuest(now);return true end
+        if id=="quest" then return ensureQuest(now) end
         if id=="collect" then
             if not collectTarget then collectTarget=nearestFruit(now);collectStart=now;collectTouches=0;collectTouchAt=-math.huge end
             local fruit=collectTarget
@@ -1342,6 +1529,7 @@ local function newAdapter(player,remote,services,config,report)
         return d
     end
     function adapter.suspend(id,transfer)
+        combat:reset()
         if id=="farm" or id=="collect" or id=="race2" or id=="swordfarm" or id=="navigate" or
             id=="mastery" or id=="item" or id=="boss" or id=="event" or id=="quest" then
             if transfer then return movement:handoff() end
@@ -1352,6 +1540,7 @@ local function newAdapter(player,remote,services,config,report)
     function adapter.cleanupDeferred() return movement.deferred==true end
     function adapter.close(force)
         if closed then return true end
+        combat:close()
         if not movement:close(force) then return false end
         closed=true;transport:close();groundConnection:Disconnect();return true
     end
@@ -1541,6 +1730,7 @@ local function newAdapter(player,remote,services,config,report)
         return false
     end
     local function skillCombat(target,tool,now,hoverCombat,taskId)
+        combat:reset() -- release melee orbit before skill/hover ownership
         local c,h,r=character();if not c then releaseInput();return false end
         local er=target and target:FindFirstChild("HumanoidRootPart")
         local eh=target and target:FindFirstChildOfClass("Humanoid")
@@ -1611,9 +1801,37 @@ local function newAdapter(player,remote,services,config,report)
     -- Character movement never controls a boat. Only normal seat controls are used.
     local boatSeat,boatBest,boatProgress,boatGoal=nil,math.huge,0,nil
     local boatOriginal
+    local boatBoard={seat=nil,at=-math.huge,attempts=0}
+    local function availableBoat(h)
+        local function usable(seat,known)
+            if not seat or not seat.Parent or not seat:IsA("VehicleSeat") or not seat:IsDescendantOf(workspace) then return false end
+            if seat.Occupant and seat.Occupant~=h then return false end
+            local obj=seat.Parent;local found=false
+            while obj and obj~=workspace do
+                local owner=obj:FindFirstChild("Owner")
+                if owner then
+                    if owner.Value~=player and tostring(owner.Value)~=player.Name and (not player.UserId or tostring(owner.Value)~=tostring(player.UserId)) then return false end
+                    found=true
+                end
+                local hp=obj:FindFirstChild("Health")
+                if hp and type(hp.Value)=="number" and hp.Value<=0 then return false end
+                obj=obj.Parent
+            end
+            return found or known
+        end
+        if usable(h.SeatPart,true) then return h.SeatPart end
+        if usable(boatSeat,true) then return boatSeat end
+        boatSeat=nil
+        local boats=workspace:FindFirstChild("Boats")
+        for _,model in ipairs(boats and boats:GetChildren() or {}) do
+            local seat=model:FindFirstChildWhichIsA("VehicleSeat",true)
+            if usable(seat,false) then boatSeat=seat;return seat end
+        end
+    end
+    function adapter.resetBoarding() boatBoard={seat=nil,at=-math.huge,attempts=0} end
     local function boatStop()
         releaseInput();pulseKey=nil
-        if boatSeat and boatOriginal then pcall(function() boatSeat.ThrottleFloat=boatOriginal.throttle;boatSeat.SteerFloat=boatOriginal.steer end) end
+        if boatOriginal and boatOriginal.seat then pcall(function() boatOriginal.seat.ThrottleFloat=boatOriginal.throttle;boatOriginal.seat.SteerFloat=boatOriginal.steer end) end
         boatOriginal=nil;boatBest=math.huge;boatGoal=nil
     end
     local function boat(now)
@@ -1623,25 +1841,22 @@ local function newAdapter(player,remote,services,config,report)
         local seat=h.SeatPart
         if not seat or not seat:IsA("VehicleSeat") then
             boatStop()
-            if boatSeat and boatSeat.Parent then
-                local owner=boatSeat:FindFirstAncestorOfClass("Model");owner=owner and owner:FindFirstChild("Owner")
-                if owner and tostring(owner.Value)~=player.Name then boatSeat=nil end
-            end
-            if not boatSeat then
-                local boats=workspace:FindFirstChild("Boats")
-                for _,model in ipairs(boats and boats:GetChildren() or {}) do
-                    local owner=model:FindFirstChild("Owner")
-                    if owner and tostring(owner.Value)==player.Name then boatSeat=model:FindFirstChildWhichIsA("VehicleSeat",true);if boatSeat then break end end
-                end
-            end
+            boatSeat=availableBoat(h)
             if not boatSeat then state("boat","en attente","Aucun bateau possede charge. Achete-en un manuellement puis assieds-toi.");return true end
-            if moveTo(boatSeat.CFrame*CFrame.new(0,2,0),3) then boatSeat:Sit(h) end
+            if boatBoard.seat~=boatSeat then boatBoard={seat=boatSeat,at=-math.huge,attempts=0} end
+            if moveTo(boatSeat.CFrame*CFrame.new(0,2,0),3) and now-boatBoard.at>=2 then
+                if (r.Position-boatSeat.Position).Magnitude>7 then error("Position libre hors portee du siege; embarquement arrete") end
+                if boatBoard.attempts>=3 then error("Embarquement refuse apres trois essais; bateau arrete") end
+                boatBoard.attempts=boatBoard.attempts+1;boatBoard.at=now;boatSeat:Sit(h)
+            end
             state("boat","en deplacement","Rejoindre son siege; controle bateau encore OFF");return false
         end
+        if availableBoat(h)~=seat then boatStop();state("boat","en attente","Bateau detruit, occupe ou non autorise");return true end
+        boatBoard={seat=nil,at=-math.huge,attempts=0}
         if not stopMovement() then error(movement.blocked) end
         if services.characterController.flying then error("Vol incompatible avec navigation") end
         if boatSeat~=seat then boatStop();boatSeat=seat end
-        if not boatOriginal then boatOriginal={throttle=seat.ThrottleFloat,steer=seat.SteerFloat} end
+        if not boatOriginal then boatOriginal={seat=seat,throttle=seat.ThrottleFloat,steer=seat.SteerFloat} end
         local delta=dest-seat.Position;delta=Vector3.new(delta.X,0,delta.Z)
         local distance=delta.Magnitude
         if boatGoal~=dest then boatGoal=dest;boatBest=distance;boatProgress=now end
@@ -1862,7 +2077,7 @@ local function newAdapter(player,remote,services,config,report)
         return advancedStep(id,now)
     end
     function adapter.suspend(id,transfer)
-        releaseInput();pulseKey=nil
+        combat:reset();releaseInput();pulseKey=nil
         if id=="boat" then boatStop();local _,h=character();if transfer and h then h.Sit=false end end
         if id=="sword" or id=="race3" or id=="summon" or id=="puzzle" or id=="boat" then
             if transfer then return movement:handoff() end
@@ -1875,10 +2090,12 @@ local function newAdapter(player,remote,services,config,report)
     function adapter.diagnostics()
         local d=advancedDiagnostics();d.legendarySpent=legendarySpent;d.race3=v3.stage;d.boat=boatSeat and boatSeat.Name or "--";return d
     end
+    do (function()
     -- Loaded-world maritime targets; no template scanning or guessed sea-event remotes.
     local marineTargets,marineScan={},-math.huge
     local marineFacades=setmetatable({},{__mode="k"})
     local marineCurrent,marineCompleted=nil,0
+    local marineRecovering=false
     local searchStarted,patrolAnchor,patrolIndex=nil,nil,1
     local mirageOriginal,mirageRouting,mirageRouteIsland,mirageRouteTarget=nil,false,nil,nil
     local function maritimeName(model)
@@ -1903,10 +2120,17 @@ local function newAdapter(player,remote,services,config,report)
         end
     end
     local function marineFacade(model)
-        if marineFacades[model] then return marineFacades[model] end
+        if marineFacades[model] and marineFacades[model].root.Parent then return marineFacades[model] end
         local root=model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart or model:FindFirstChild("RootPart")
         local read=marineHealth(model)
         if not root or not root:IsA("BasePart") or not read then return end
+        local rawRead=read
+        read=function()
+            local ok,hp,max=pcall(rawRead)
+            if not ok or type(hp)~="number" or hp~=hp or hp==math.huge then return nil end
+            if type(max)~="number" or max~=max or max<=0 or max==math.huge then max=math.max(1,hp) end
+            return hp,max
+        end
         local health=setmetatable({},{__index=function(_,field) local hp,max=read();if field=="Health" then return hp or 0 elseif field=="MaxHealth" then return max or 1 end end})
         local proxy={model=model,root=root,read=read}
         function proxy:FindFirstChild(name) if name=="HumanoidRootPart" then return self.root end end
@@ -1934,9 +2158,15 @@ local function newAdapter(player,remote,services,config,report)
     local function selectedMarine(now,wanted)
         scanMarine(now)
         local _,_,root=character();if not root then return end
-        local best,dist=nil,config.marineDetectRange
         for _,target in ipairs(marineTargets) do
-            if wanted[target.name] and target.model.Parent and target.proxy then
+            if target.model==marineCurrent and wanted[target.name] and target.proxy and target.model.Parent and target.proxy.root.Parent then
+                local hp=target.proxy.read()
+                if hp and hp>0 and (root.Position-target.proxy.root.Position).Magnitude<(config.marineDetectRange or 2500) then return target end
+            end
+        end
+        local best,dist=nil,config.marineDetectRange or 2500
+        for _,target in ipairs(marineTargets) do
+            if wanted[target.name] and target.model.Parent and target.proxy and target.proxy.root.Parent then
                 local health=target.proxy.read()
                 if type(health)=="number" and health>0 then
                     local d=(root.Position-target.proxy.root.Position).Magnitude
@@ -1948,7 +2178,7 @@ local function newAdapter(player,remote,services,config,report)
     end
     local function wantedMarine()
         local result={}
-        for raw in config.marineTargets:gmatch("[^,]+") do
+        for raw in (config.marineTargets or "Sea Beast"):gmatch("[^,]+") do
             local name=raw:match("^%s*(.-)%s*$")
             if name~="Sea Beast" and name~="Piranha" and name~="Fish Crew Member" and name~="Shark" and name~="Terrorshark" then error("Cible maritime inconnue : "..name) end
             result[name]=true
@@ -1962,19 +2192,24 @@ local function newAdapter(player,remote,services,config,report)
     local function patrol(now,id)
         local _,h=character();if not h then state(id,"en attente","Respawn");return false end
         if not config.marinePatrol then state(id,"en attente","Aucune cible chargee. Patrouille OFF; aucune apparition garantie");return true end
+        local seat=availableBoat(h)
+        if not seat then boatStop();patrolAnchor=nil;searchStarted=nil;state(id,"en attente","Bateau manquant / detruit : acheter un bateau");return true end
         if not searchStarted then searchStarted=now end
         if now-searchStarted>config.marineSearchSeconds then boatStop();error("Recherche maritime terminee sans cible dans le delai configure") end
         if not patrolAnchor then
-            local seat=h.SeatPart or boatSeat
-            if not seat or not seat.Parent then state(id,"en attente","Assieds-toi dans un bateau possede avant la patrouille");return true end
             patrolAnchor=seat.Position
+            if config.marineOffshore then
+                local heading=seat.CFrame.LookVector;heading=Vector3.new(heading.X,0,heading.Z)
+                if heading.Magnitude>0.1 then patrolAnchor=patrolAnchor+heading.Unit*config.marineSearchRadius end
+            end
         end
         local points={Vector3.new(1,0,0),Vector3.new(0,0,1),Vector3.new(-1,0,0),Vector3.new(0,0,-1)}
         local saved=config.boatDestination
-        config.boatDestination=patrolAnchor+points[patrolIndex]*config.marineSearchRadius
+        config.boatDestination=patrolAnchor+points[patrolIndex]*config.marineSearchRadius*(config.marineOffshore and .35 or 1)
         local ok,done=pcall(boat,now)
         config.boatDestination=saved
         if not ok then error(done) end
+        if done and statuses.boat and statuses.boat.state~="terminee" then state(id,"en attente",statuses.boat.reason);return true end
         if done and statuses.boat and statuses.boat.state=="terminee" then patrolIndex=patrolIndex%4+1 end
         state(id,"en deplacement","Patrouille bateau bornee / point "..patrolIndex.." ; aucun fly maritime")
         return false
@@ -1986,20 +2221,30 @@ local function newAdapter(player,remote,services,config,report)
             if previous then local health=previous.read();if health and health<=0 then marineCompleted=marineCompleted+1 end end
         end
         marineCurrent=target.model
-        if h.Health/h.MaxHealth<config.marineHealthReserve then
+        if h.Health/h.MaxHealth<(config.marineHealthReserve or .35) then marineRecovering=true;skillLastTarget=nil end
+        if marineRecovering then
             releaseInput();boatStop()
-            state(id,"en attente","Sante faible; retour au bateau, aucune attaque")
+            if h.Health/h.MaxHealth>=math.max(.65,(config.marineHealthReserve or .35)+.15) then marineRecovering=false;skillLastTarget=nil;return false end
+            state(id,"en attente","Recuperation : retour bateau / reprise a 65 %")
             local saved=config.boatDestination
-            if boatSeat and boatSeat.Parent then config.boatDestination=boatSeat.Position;local ok,err=pcall(boat,now);config.boatDestination=saved;if not ok then error(err) end end
+            local seat=availableBoat(h)
+            if seat then config.boatDestination=seat.Position;local ok,err=pcall(boat,now);config.boatDestination=saved;if not ok then error(err) end
+            else if not stopMovement() then error(movement.blocked) end;state(id,"en attente","Sante faible / bateau absent") end
             return false
         end
         -- Stop seat controls before leaving it; flight never controls the boat.
         if boatOriginal or h.SeatPart then boatStop() end
-        if h.SeatPart and h.SeatPart:IsA("VehicleSeat") then
+        if h.Sit==true and h.SeatPart and h.SeatPart:IsA("VehicleSeat") then
             boatSeat=h.SeatPart;h.Sit=false;state(id,"en attente","Quitter le siege avant le combat");return false
         end
         local tool=findTool(config.marineTool)
-        if not tool then error("Choisir le nom exact d'un equipement maritime possede") end
+        if not tool and (not config.marineTool or config.marineTool=="") then
+            for item in pairs(carried()) do
+                if item.ToolTip=="Blox Fruit" then tool=item;break end
+                if not tool and (item.ToolTip=="Sword" or item.ToolTip=="Melee" or item.ToolTip=="Gun") then tool=item end
+            end
+        end
+        if not tool then error("Equipement maritime possede introuvable") end
         if tool.ToolTip~="Blox Fruit" and tool.ToolTip~="Gun" and tool.ToolTip~="Sword" and tool.ToolTip~="Melee" then error("Equipement sans skills reconnus") end
         local pos=target.proxy.root.CFrame*CFrame.new(0,math.min(config.marineHeight,config.skillRange*0.4),config.skillRange*0.5)
         local _,_,root=character()
@@ -2029,6 +2274,12 @@ local function newAdapter(player,remote,services,config,report)
             if health and health<=0 then marineCompleted=marineCompleted+1 end
             marineCurrent=nil;releaseInput()
             if not stopMovement() then error(movement.blocked) end
+        end
+        local _,h=character();local seat=h and availableBoat(h)
+        if seat and h.SeatPart~=seat then
+            local saved=config.boatDestination;config.boatDestination=seat.Position
+            local ok,result=pcall(boat,now);config.boatDestination=saved;if not ok then error(result) end
+            state(id,"en deplacement","Retour au bateau");return false
         end
         return patrol(now,id)
     end
@@ -2104,7 +2355,12 @@ local function newAdapter(player,remote,services,config,report)
                     if wanted[entry.name] and not entry.proxy then state(id,"en attente",entry.name.." detecte : sante/position non lisibles, schema non pris en charge");return false end
                 end
             end
-            if config.marinePatrol then return true end
+            if marineCurrent then return true end
+            if config.marinePatrol then
+                local _,h=character()
+                if h and availableBoat(h) then return true end
+                state(id,"en attente","Bateau manquant / detruit : acheter un bateau");return false
+            end
             state(id,"en attente","Aucune cible/ile chargee; patrouille OFF")
             return false
         end
@@ -2117,13 +2373,21 @@ local function newAdapter(player,remote,services,config,report)
     end
     function adapter.suspend(id,transfer)
         if id=="marine" or id=="seafish" or id=="mirage" then
-            releaseInput();boatStop();restoreMirageRoute()
+            combat:reset();releaseInput();boatStop();restoreMirageRoute();skillLastTarget=nil
             if transfer then return movement:handoff() end
             return movement:stop()
         end
         return baseSuspend(id,transfer)
     end
     function adapter.close(force) restoreMirageRoute();return baseClose(force) end
+    local maritimeEnable=adapter.setEnabled
+    function adapter.setEnabled(id,value)
+        maritimeEnable(id,value)
+        if id=="marine" or id=="seafish" or id=="mirage" or id=="boat" then
+            if value then adapter.resetBoarding() end
+            if not value then searchStarted=nil;patrolAnchor=nil;marineCurrent=nil;marineRecovering=false end
+        end
+    end
     function adapter.raceOverview(now)
         requestInventory(now)
         local data=player:FindFirstChild("Data");local race=data and data:FindFirstChild("Race")
@@ -2153,6 +2417,388 @@ local function newAdapter(player,remote,services,config,report)
         end
         return loadedReady(id,now)
     end
+    end)() end
+    do (function()
+    -- A style is trained only after its real Tool/Level is observed.
+    -- New purchases use normal visible NPC offers, never guessed Buy* remotes.
+    local STYLE_TARGETS={
+        {name="Combat",aliases={"Combat"},optional=true,trainOnly=true},
+        {name="Dark Step",aliases={"Dark Step","Black Leg"},teachers={"Dark Step Teacher"},seas={1,2,3},beli=150000},
+        {name="Electric",aliases={"Electric","Electro"},teachers={"Mad Scientist"},seas={1,2,3},beli=500000,rare="Lightning Bolt / prerequis actuels du professeur"},
+        {name="Water Kung Fu",aliases={"Water Kung Fu","Fishman Karate"},teachers={"Water Kung Fu Teacher","Water Kung-fu Teacher"},seas={1,2,3},beli=750000},
+        {name="Dragon Breath",aliases={"Dragon Breath","Dragon Claw"},teachers={"Sabi"},seas={2,3},fragments=1500},
+        {name="Superhuman",aliases={"Superhuman"},teachers={"Martial Arts Master"},seas={2,3},beli=3000000,requires={"Dark Step","Electric","Water Kung Fu","Dragon Breath"},minimum=300},
+        {name="Death Step",aliases={"Death Step"},teachers={"Phoeyu, the Reformed","Phoeyu the Reformed"},seas={2,3},beli=2500000,fragments=5000,requires={"Dark Step"},minimum=400,rare="Library Key / porte du professeur"},
+        {name="Sharkman Karate",aliases={"Sharkman Karate"},teachers={"Sharkman Teacher","Daigrock, the Sharkman","Daigrock the Sharkman"},seas={2,3},beli=2500000,fragments=5000,requires={"Water Kung Fu"},minimum=400,rare="Water Key"},
+        {name="Electric Claw",aliases={"Electric Claw"},teachers={"Previous Hero"},seas={3},beli=3000000,fragments=5000,requires={"Electric"},minimum=400,quest="Epreuve du Previous Hero a valider manuellement"},
+        {name="Dragon Talon",aliases={"Dragon Talon"},teachers={"Uzoth"},seas={3},beli=3000000,fragments=5000,requires={"Dragon Breath"},minimum=400,rare="Fire Essence"},
+        {name="Godhuman",aliases={"Godhuman","God Human"},teachers={"Ancient Monk"},seas={3},beli=5000000,fragments=5000,requires={"Superhuman","Death Step","Sharkman Karate","Electric Claw","Dragon Talon"},minimum=400,rare="Materiaux du Godhuman"},
+        {name="Sanguine Art",aliases={"Sanguine Art"},teachers={"Shafi"},seas={3},beli=5000000,fragments=5000,rare="Leviathan Heart et materiaux"},
+        {name="Advanced Combat",aliases={"Advanced Combat"},trainOnly=true,quest="Puzzle Advanced Combat non implemente; aucun fruit/style retire automatiquement"},
+    }
+    local styleRecords,styleCurrent,stylePending={},nil,nil
+    local styleBeliSpent,styleFragmentsSpent,styleCheckAt=0,0,0
+    local styleLastChoice,styleTeacherCache,styleTeacherAt=nil,{},-math.huge
+    for _,entry in ipairs(STYLE_TARGETS) do styleRecords[entry.name]={value=0,owned=false,nextAt=0,reason="Non verifie"} end
+    local function styleTool(entry)
+        for tool in pairs(carried()) do
+            if tool.ToolTip=="Melee" then
+                for _,alias in ipairs(entry.aliases) do if tool.Name==alias then return tool end end
+            end
+        end
+    end
+    local function observeStyles()
+        for _,entry in ipairs(STYLE_TARGETS) do
+            local record=styleRecords[entry.name];local tool=styleTool(entry)
+            local value=tool and tool:FindFirstChild("Level")
+            if value and type(value.Value)=="number" then record.owned=true;record.value=math.max(record.value,value.Value) end
+            if inventoryValid and clock()-inventoryAt<=20 then
+                for _,alias in ipairs(entry.aliases) do
+                    local item=inventory[alias]
+                    if item and (item.type=="Melee" or item.type=="FightingStyle") and item.mastery then
+                        record.owned=true;record.value=math.max(record.value,item.mastery)
+                    end
+                end
+            end
+            if record.value>=600 then record.reason="600 confirme" end
+        end
+    end
+    local function styleTeacher(entry,now)
+        if now>=styleTeacherAt then
+            styleTeacherAt=now+1;styleTeacherCache={}
+            for _,folder in pairs({workspace:FindFirstChild("NPCs"),game:GetService("ReplicatedStorage"):FindFirstChild("NPCs")}) do
+                for _,npc in ipairs(folder and folder:GetChildren() or {}) do
+                    if not styleTeacherCache[npc.Name] then styleTeacherCache[npc.Name]=npc end
+                end
+            end
+        end
+        for _,name in ipairs(entry.teachers or {}) do if styleTeacherCache[name] then return name,styleTeacherCache[name] end end
+    end
+    local function styleEligible(entry,now)
+        local record=styleRecords[entry.name]
+        if record.uncertain then record.reason="Achat incertain : essai bloque jusqu'a verification manuelle";return false end
+        if now<record.nextAt then return false end
+        if entry.trainOnly then record.reason=entry.quest or "Combat de depart absent; aucun remplacement force";return false end
+        local correctSea=false;for _,number in ipairs(entry.seas or {}) do if sea==number then correctSea=true end end
+        if not correctSea then record.reason="Professeur dans une autre mer; changement de mer manuel";return false end
+        if entry.rare and not record.owned and not config.allowStyleMaterials then record.reason="Autorisation objets/materiaux requise : "..entry.rare;return false end
+        for _,name in ipairs(entry.requires or {}) do
+            local other=styleRecords[name]
+            if other.owned and other.value<(entry.minimum or 400) then record.reason=name.." : mastery "..(entry.minimum or 400).." requise";return false end
+        end
+        if not styleTeacher(entry,now) then record.reason="Professeur non detecte dans les references chargees";return false end
+        return true
+    end
+    local function chooseStyle(now)
+        if now>=styleCheckAt then styleCheckAt=now+30;requestInventory(now) end
+        observeStyles()
+        if stylePending then return stylePending.entry end
+        if styleCurrent then
+            local record=styleRecords[styleCurrent.name]
+            if record.value<600 and (styleTool(styleCurrent) or styleEligible(styleCurrent,now)) then return styleCurrent end
+            styleCurrent=nil
+        end
+        -- Finish the currently owned style before replacing it with a purchase.
+        for _,entry in ipairs(STYLE_TARGETS) do
+            if styleRecords[entry.name].value<600 and styleTool(entry) then styleCurrent=entry;return entry end
+        end
+        local complete,total=0,0
+        for _,entry in ipairs(STYLE_TARGETS) do
+            if not entry.optional or styleRecords[entry.name].owned then
+                total=total+1;if styleRecords[entry.name].value>=600 then complete=complete+1 end
+            end
+        end
+        if complete==total then return nil,true end
+        for _,entry in ipairs(STYLE_TARGETS) do
+            if styleRecords[entry.name].value<600 and styleEligible(entry,now) then styleCurrent=entry;return entry end
+        end
+        return nil,false
+    end
+    local function displayedStyleCosts(text)
+        text=text:gsub("<[^>]+>","")
+        if text:lower():find("robux",1,true) or text:find("R$",1,true) or text:find(utf8.char(0xE002),1,true) then return nil,nil end
+        local beli=beliPrice(text)
+        local raw=text:lower():match("([%d,%. ]+)%s*fragments?")
+        local fragments=raw and tonumber((raw:gsub("[,%. ]","")))
+        if not beli and not fragments and (text:lower():find("free",1,true) or text:lower():find("gratuit",1,true)) then return 0,0 end
+        return beli,fragments
+    end
+    local function trainStyle(entry,tool,now)
+        if styleLastChoice~=tool then
+            styleLastChoice=tool;masteryStart=0;masteryLast=0;masteryKills=0;masteryTarget=nil
+            healthTrack=setmetatable({},{__mode="k"});observedDamage=0
+        end
+        local oldTool,oldGoal,oldWeapon,oldExact=config.masteryTool,config.masteryGoal,config.weapon,config.exactWeapon
+        config.masteryTool=tool.Name;config.masteryGoal=600;config.weapon="Melee";config.exactWeapon=tool.Name
+        local ok,result=pcall(mastery,now)
+        config.masteryTool,config.masteryGoal,config.weapon,config.exactWeapon=oldTool,oldGoal,oldWeapon,oldExact
+        if not ok then error(result) end
+        local detail=statuses.mastery
+        state("mastery",detail and detail.state=="en deplacement" and "en deplacement" or "en combat",entry.name.." : "..styleRecords[entry.name].value.." / 600; cycle automatique")
+        return result
+    end
+    local function runStyleCycle(now)
+        local entry,complete=chooseStyle(now)
+        if complete then state("mastery","terminee","Tous les styles du catalogue confirmes a 600; les autres options actives reprennent");return true end
+        if not entry then state("mastery","en attente","Styles restants : prerequis/professeurs a rendre disponibles; farm autorise");return true end
+        local record=styleRecords[entry.name];local tool=styleTool(entry)
+        if stylePending then
+            local receivedLevel=tool and tool:FindFirstChild("Level")
+            if receivedLevel and type(receivedLevel.Value)=="number" then
+                stylePending=nil;record.owned=true;styleCurrent=entry
+                say("Style recu et confirme : "..entry.name.."; entrainement vers 600")
+            elseif now-stylePending.at>15 then
+                record.uncertain=true;record.reason="Achat non confirme; aucune seconde demande";stylePending=nil;styleCurrent=nil
+                state("mastery","en attente",entry.name.." : "..record.reason);say(entry.name.." : "..record.reason);return true
+            else state("mastery","en attente","Verification de l'equipement recu : "..entry.name);return false end
+        end
+        if tool then
+            if record.value>=600 then styleCurrent=nil;return false end
+            return trainStyle(entry,tool,now)
+        end
+        local teacher,npc=styleTeacher(entry,now)
+        if not teacher then record.reason="Professeur non charge";styleCurrent=nil;return true end
+        local contexts={teacher};for _,alias in ipairs(entry.aliases) do contexts[#contexts+1]=alias end
+        local dialog=findDialog(now,contexts)
+        if not dialog then
+            if npc:IsDescendantOf(workspace) then return interactNpc(teacher,"mastery",now) end
+            local destination=positionOf(npc)
+            if destination then
+                state("mastery","en deplacement","Rejoindre le professeur reference : "..teacher)
+                if moveTo(destination*CFrame.new(0,0,3),3) then record.reason="Attente chargement du professeur";record.nextAt=now+10;styleCurrent=nil;return true end
+                return false
+            end
+            record.nextAt=now+30;record.reason="Position du professeur indisponible";styleCurrent=nil;return true
+        end
+        local buy=actionButton(dialog,{"buy","purchase","acheter","learn","apprendre","relearn","equip","equiper"})
+        if not buy then record.reason=entry.quest or "Prerequis/refus du professeur : aucun bouton d'achat actif";record.nextAt=now+30;styleCurrent=nil;state("mastery","en attente",entry.name.." : "..record.reason);return true end
+        local text=dialog.text.." "..buy.Text
+        local beli,fragments=displayedStyleCosts(text)
+        if beli==nil and fragments==nil then record.reason="Prix Beli/Fragments non lisible; aucune depense";record.nextAt=now+30;styleCurrent=nil;return true end
+        if (entry.beli or 0)>0 and beli==nil or (entry.fragments or 0)>0 and fragments==nil and beli~=0 then
+            record.reason="Prix incomplet : currencies manquantes";record.nextAt=now+30;styleCurrent=nil;return true
+        end
+        beli,fragments=beli or 0,fragments or 0
+        local data=player:FindFirstChild("Data");local fv=data and data:FindFirstChild("Fragments");local availableFragments=fv and fv.Value or 0
+        if beli>6000000 or fragments>10000 or styleBeliSpent+beli>30000000 or styleFragmentsSpent+fragments>50000 or beli>0 and wallet()-beli<(config.reserve or 100000) or availableFragments<fragments then
+            record.reason="Fonds/reserve/plafonds internes insuffisants";record.nextAt=now+30;styleCurrent=nil;state("mastery","en attente",entry.name.." : "..record.reason);return true
+        end
+        -- Setting pending BEFORE clicking also blocks a second click if input errors.
+        styleBeliSpent=styleBeliSpent+beli;styleFragmentsSpent=styleFragmentsSpent+fragments
+        stylePending={entry=entry,at=now};interactions.mastery=nil
+        clickButton(buy)
+        state("mastery","en attente","Achat unique de "..entry.name.."; reception de l'outil a confirmer")
+        return false
+    end
+    local cycleReady,cycleStep,cycleEnabled=adapter.ready,adapter.step,adapter.setEnabled
+    function adapter.ready(id,now)
+        if id=="mastery" and config.masteryCycle then
+            if not cycleReady(id,now) then return false end
+            local entry,complete=chooseStyle(now)
+            if entry or complete then return true end
+            state(id,"en attente","Styles indisponibles ou prerequis manquants; les autres options continuent")
+            return false
+        end
+        return cycleReady(id,now)
+    end
+    function adapter.step(id,now)
+        if id=="mastery" and config.masteryCycle then currentId=id;return runStyleCycle(now) end
+        return cycleStep(id,now)
+    end
+    function adapter.setEnabled(id,value)
+        cycleEnabled(id,value)
+        if id=="mastery" and not value then styleCurrent=nil;releaseInput();pulseKey=nil end
+    end
+    function adapter.styleOverview()
+        observeStyles();local lines={}
+        for _,entry in ipairs(STYLE_TARGETS) do
+            local r=styleRecords[entry.name]
+            lines[#lines+1]=entry.name.." : "..r.value.." / 600 — "..(r.value>=600 and "confirme" or r.reason)
+        end
+        return table.concat(lines,"\n")
+    end
+    function adapter.resetStylePurchase()
+        if stylePending then return false end
+        for _,record in pairs(styleRecords) do record.uncertain=false;record.nextAt=0 end
+        return true
+    end
+    end)() end
+
+    do (function()
+    -- Independent implementation. Public examples were studied, not copied.
+    local chestIndex=setmetatable({},{__mode="k"})
+    local skipped=setmetatable({},{__mode="k"})
+    local links,scanWorker={},nil
+    local disposing=false
+    local target,pending,started=nil,nil,0
+    local eliteName,eliteModel
+    local disappearances,beliObserved=0,0
+    local function loaded(obj)
+        return obj and obj.Parent and obj:IsDescendantOf(workspace) and obj:GetAttribute("IsDisabled")~=true
+    end
+    local function registerChest(obj)
+        if (obj:IsA("BasePart") or obj:IsA("Model")) and (obj.Name=="Chest1" or obj.Name=="Chest2" or obj.Name=="Chest3") then chestIndex[obj]=true end
+    end
+    links[#links+1]=workspace.DescendantAdded:Connect(registerChest)
+    local ok,collection=pcall(function() return game:GetService("CollectionService") end)
+    if ok and collection then
+        local good,tagged=pcall(function() return collection:GetTagged("_ChestTagged") end)
+        if good then for _,obj in ipairs(tagged) do chestIndex[obj]=true end end
+        local goodSignal,signal=pcall(function() return collection:GetInstanceAddedSignal("_ChestTagged") end)
+        if goodSignal then links[#links+1]=signal:Connect(function(obj) chestIndex[obj]=true end) end
+    end
+    scanWorker=task.spawn(function()
+        for i,obj in ipairs(workspace:GetDescendants()) do
+            if disposing then return end
+            registerChest(obj);if i%150==0 then task.wait() end
+        end
+    end)
+    -- Share this loaded-object cache with the existing Rabbit V3 helper.
+    chests=function()
+        local list={}
+        for obj in pairs(chestIndex) do if loaded(obj) then list[#list+1]=obj end end
+        return list
+    end
+    local function rareHeld()
+        return hasItem("Fist of Darkness") or hasItem("God's Chalice") or hasItem("God’s Chalice") or hasItem("Sweet Chalice")
+    end
+    local function chestPart(obj)
+        if obj:IsA("BasePart") then return obj end
+        if obj:IsA("Model") and obj.PrimaryPart then return obj.PrimaryPart end
+        return obj:FindFirstChildWhichIsA("BasePart",true)
+    end
+    local function nearestChest(now)
+        local _,_,root=character();if not root then return end
+        local best,dist=nil,config.chestRange or 1500
+        for obj in pairs(chestIndex) do
+            if (obj:IsA("BasePart") or obj:IsA("Model")) and loaded(obj) and now>=(skipped[obj] or 0) then
+                local part=chestPart(obj)
+                if part and not obj:FindFirstAncestorOfClass("Tool") then
+                    local d=(part.Position-root.Position).Magnitude
+                    if d<dist then best,dist=obj,d end
+                end
+            end
+        end
+        return best
+    end
+    local function chestRun(now)
+        if rareHeld() then state("chest","en attente","Objet rare porte : collecte des coffres suspendue");return true end
+        if pending then
+            if not loaded(pending.object) then
+                disappearances=disappearances+1
+                local delta=math.max(0,wallet()-pending.balance);beliObserved=beliObserved+delta
+                state("chest","en attente","Coffre disparu / Beli +"..delta.." observe; attribution non garantie")
+                pending=nil;target=nil;stopMovement();return true
+            end
+            if now-pending.at>=8 then
+                skipped[pending.object]=now+90;pending=nil;target=nil;stopMovement()
+                state("chest","en attente","Ramassage non confirme; coffre ignore pendant 90 s");return true
+            end
+            state("chest","en attente","Verification du ramassage; aucune seconde interaction");return false
+        end
+        if not target then target=nearestChest(now);started=now end
+        if not target or not loaded(target) then target=nil;stopMovement();state("chest","en attente","Aucun coffre charge disponible dans le rayon choisi");return true end
+        if now-started>30 then skipped[target]=now+90;target=nil;stopMovement();state("chest","en attente","Trajet coffre expire; recherche d'une autre cible");return true end
+        local part=chestPart(target)
+        if not part then skipped[target]=now+90;target=nil;return true end
+        state("chest","en deplacement","Coffre charge : "..target.Name)
+        local offset=part.Size and part.Size.Y/2+3 or 3
+        if not moveTo(part.CFrame*CFrame.new(0,offset,0),1.5) then return false end
+        if not stopMovement() then error(movement.blocked) end
+        local _,_,root=character();if not root then return false end
+        if (root.Position-part.Position).Magnitude>10 then
+            skipped[target]=now+90;target=nil;state("chest","en attente","Arret libre hors portee du coffre");return true
+        end
+        local prompt=target:FindFirstChildWhichIsA("ProximityPrompt",true)
+        pending={object=target,at=now,balance=wallet()}
+        local success,err=pcall(function()
+            if prompt and prompt.Enabled and type(fireproximityprompt)=="function" then fireproximityprompt(prompt)
+            elseif type(firetouchinterest)=="function" then firetouchinterest(root,part,0);firetouchinterest(root,part,1)
+            else error("Interaction coffre indisponible dans cet executeur") end
+        end)
+        if not success then skipped[target]=now+90;pending=nil;target=nil;error(tostring(err)) end
+        state("chest","en attente","Interaction envoyee une fois; verification du coffre")
+        return false
+    end
+    local eliteNames={"Diablo","Deandre","Urban"}
+    local function eliteAlive(model)
+        local h=model and model:FindFirstChildOfClass("Humanoid")
+        return loaded(model) and h and h.Health>0
+    end
+    local function chooseElite(now)
+        if eliteAlive(eliteModel) and (not config.eliteTarget or config.eliteTarget=="Tous" or eliteName==config.eliteTarget) then return eliteName,eliteModel end
+        eliteName,eliteModel=nil,nil
+        refreshEnemies(now)
+        local _,_,root=character();if not root then return end
+        local distance=config.eliteRange or 5000
+        for _,name in ipairs(eliteNames) do
+            if not config.eliteTarget or config.eliteTarget=="Tous" or config.eliteTarget==name then
+                for _,model in ipairs(enemies[name] or {}) do
+                    local part=model:FindFirstChild("HumanoidRootPart")
+                    if part and eliteAlive(model) then
+                        local d=(part.Position-root.Position).Magnitude
+                        if d<distance then eliteName,eliteModel,distance=name,model,d end
+                    end
+                end
+            end
+        end
+        return eliteName,eliteModel
+    end
+    local oldReady,oldStep,oldSuspend,oldClose,oldEnabled,oldDiagnostics=adapter.ready,adapter.step,adapter.suspend,adapter.close,adapter.setEnabled,adapter.diagnostics
+    function adapter.ready(id,now)
+        if id=="chest" then
+            if rareHeld() then state(id,"en attente","Objet rare porte : collecte suspendue; autres options disponibles");return false end
+            if pending or loaded(target) or nearestChest(now) then return true end
+            state(id,"en attente","Aucun coffre charge dans le rayon; farm disponible");return false
+        end
+        if id=="elite" then
+            if sea~=3 then state(id,"en attente","Elites Diablo / Deandre / Urban : Sea 3 requise");return false end
+            local name=chooseElite(now)
+            if not name then state(id,"en attente","Aucune elite chargee et vivante; farm disponible") end
+            return name~=nil
+        end
+        return oldReady(id,now)
+    end
+    function adapter.step(id,now)
+        if id=="chest" then currentId=id;return chestRun(now) end
+        if id=="elite" then
+            currentId=id
+            local name=chooseElite(now)
+            if not name then stopMovement();state(id,"en attente","Elite disparue ou vaincue; recherche suspendue");return true end
+            fightNamed(name,nil,now)
+            state(id,movement.goal and "en deplacement" or "en combat",lastMessage.." / quete Elite Hunter non acceptee automatiquement")
+            return false
+        end
+        return oldStep(id,now)
+    end
+    function adapter.setEnabled(id,value)
+        oldEnabled(id,value)
+        if not value and id=="chest" then
+            if target and pending then skipped[target]=clock()+90 end
+            target=nil;pending=nil
+        elseif not value and id=="elite" then eliteName=nil;eliteModel=nil end
+    end
+    function adapter.suspend(id,transfer)
+        if id=="chest" or id=="elite" then
+            combat:reset();releaseInput();pulseKey=nil
+            if transfer then return movement:handoff() end
+            return movement:stop()
+        end
+        return oldSuspend(id,transfer)
+    end
+    function adapter.close(force)
+        if not disposing then
+            disposing=true
+            for _,link in ipairs(links) do link:Disconnect() end
+            if scanWorker and type(task.cancel)=="function" then pcall(task.cancel,scanWorker) end
+            links={};target=nil;pending=nil;eliteName=nil;eliteModel=nil
+        end
+        return oldClose(force)
+    end
+    function adapter.diagnostics()
+        local d=oldDiagnostics();d.chestDisappearances=disappearances;d.chestBeliObserved=beliObserved;d.eliteTarget=eliteName;return d
+    end
+    end)() end
 
     return adapter
 end
@@ -2173,15 +2819,16 @@ if pendingCleanup then
 end
 local config={bosses=true,weapon="Melee",speed=220,fruitRange=5000,phaseFlight=true,exitRadius=10,
  reserve=100000,gachaBudget=0,gachaMaxPrice=500000,shopBudget=0,shopMaxPrice=1200000,excludeFruits="",
- masteryTool="",masteryGoal=300,masteryThreshold=0.25,itemQuantity=10,replaceQuest=false,
+ masteryCycle=true,allowStyleMaterials=false,masteryTool="",masteryGoal=600,masteryThreshold=0.25,itemQuantity=10,replaceQuest=false,
  legendaryTargets="Saddi,Shisui,Wando",legendaryBudget=6000000,legendaryMaxPrice=2000000,
  skillKeys="Z,X",skillInterval=6,skillHold=0.15,skillRange=30,skillAim=true,
- boatTolerance=35,race3Budget=0,allowRare=false,summonTarget="Soul Reaper",puzzleTarget="Saber plates",marineTargets="Sea Beast",marineTool="",marinePatrol=false,
+ boatTolerance=35,race3Budget=0,allowRare=false,summonTarget="Soul Reaper",puzzleTarget="Saber plates",marineTargets="Sea Beast",marineTool="",marinePatrol=true,marineOffshore=true,
  marineDetectRange=2500,marineSearchRadius=1500,marineSearchSeconds=600,marineHeight=12,
- marineHealthReserve=0.35,mirageStandOff=180}
+ marineHealthReserve=0.35,mirageStandOff=180,chestRange=1500,eliteRange=5000,eliteTarget="Tous",uiAnimations=true,orbitCombat=true,orbitRadius=4.5,orbitSpeed=10}
 services.characterController=newCharacterController(player,services.Run)
-local colors={bg=Color3.fromRGB(9,10,13),card=Color3.fromRGB(17,18,23),accent=Color3.fromRGB(239,43,65),
-    text=Color3.fromRGB(239,244,255),muted=Color3.fromRGB(151,153,165),green=Color3.fromRGB(239,43,65)}
+local colors={bg=Color3.fromRGB(10,11,21),card=Color3.fromRGB(20,22,39),accent=Color3.fromRGB(143,100,255),
+    cyan=Color3.fromRGB(76,220,240),hover=Color3.fromRGB(32,35,58),selected=Color3.fromRGB(39,30,66),
+    text=Color3.fromRGB(239,242,255),muted=Color3.fromRGB(145,156,186),green=Color3.fromRGB(76,220,240)}
 local links,closed,pages,tabButtons,toggleButtons={},false,{},{},{}
 local toggleWidgets={}
 local engine,adapter
@@ -2193,7 +2840,31 @@ local function make(class,parent,props)
     object.Parent=parent;return object
 end
 local function corner(obj,radius) make("UICorner",obj,{CornerRadius=UDim.new(0,radius or 12)}) end
-local function stroke(obj) make("UIStroke",obj,{Color=Color3.fromRGB(125,30,42),Thickness=1,Transparency=0.15}) end
+local function stroke(obj) return make("UIStroke",obj,{Color=colors.accent,Thickness=1,Transparency=0.68,ApplyStrokeMode=Enum.ApplyStrokeMode.Border}) end
+local animations={}
+local pressedScale
+local function cancelAnimation(obj,finish)
+    local entry=animations[obj]
+    if not entry then return end
+    animations[obj]=nil
+    if entry.link then entry.link:Disconnect() end
+    entry.tween:Cancel()
+    if finish then for key,value in pairs(entry.props) do obj[key]=value end end
+end
+local function animate(obj,props,duration)
+    if closed or not obj.Parent then return end
+    cancelAnimation(obj)
+    if not config.uiAnimations then for key,value in pairs(props) do obj[key]=value end;return end
+    local tween=services.TweenService:Create(obj,TweenInfo.new(duration or .18,Enum.EasingStyle.Quad,Enum.EasingDirection.Out),props)
+    -- Minimal runtimes without completion signals apply the final state directly.
+    if not tween.Completed then for key,value in pairs(props) do obj[key]=value end;return end
+    local entry={tween=tween,props=props};animations[obj]=entry
+    entry.link=tween.Completed:Connect(function()
+        entry.link:Disconnect()
+        if animations[obj]==entry then animations[obj]=nil end
+    end)
+    tween:Play()
+end
 local function label(parent,value,size,pos)
     return make("TextLabel",parent,{Text=value,Size=size,Position=pos or UDim2.new(),BackgroundTransparency=1,
         Font=Enum.Font.Gotham,TextSize=14,TextColor3=colors.text,TextWrapped=true,
@@ -2201,8 +2872,27 @@ local function label(parent,value,size,pos)
 end
 local function button(parent,value,size,pos)
     local b=make("TextButton",parent,{Text=value,Size=size,Position=pos or UDim2.new(),BackgroundColor3=colors.card,
-        TextColor3=colors.text,TextSize=14,Font=Enum.Font.GothamMedium,TextWrapped=true,BorderSizePixel=0})
-    corner(b);return b
+        TextColor3=colors.text,TextSize=14,Font=Enum.Font.GothamMedium,TextWrapped=true,BorderSizePixel=0,AutoButtonColor=false})
+    corner(b);local edge=stroke(b)
+    local scale=make("UIScale",b,{Name="ButtonScale",Scale=1})
+    if b.MouseEnter and b.MouseLeave then
+        bind(b.MouseEnter,function()
+            if b.Active==false then return end
+            animate(b,{BackgroundColor3=colors.hover});animate(edge,{Color=colors.cyan,Transparency=.30})
+        end)
+        bind(b.MouseLeave,function()
+            local base=b:GetAttribute("SelectedTab") and colors.selected or (b:GetAttribute("Navigation") and colors.bg or colors.card)
+            animate(b,{BackgroundColor3=base});animate(edge,{Color=colors.accent,Transparency=.68})
+        end)
+    end
+    bind(b.InputBegan,function(input)
+        if b.Active==false then return end
+        if input.UserInputType==Enum.UserInputType.MouseButton1 or input.UserInputType==Enum.UserInputType.Touch then
+            if pressedScale then animate(pressedScale,{Scale=1}) end
+            pressedScale=scale;animate(scale,{Scale=.975},.09)
+        end
+    end)
+    return b
 end
 local gui=make("ScreenGui",playerGui,{Name="PolarisMobileDemo",ResetOnSpawn=false,DisplayOrder=40,
     ZIndexBehavior=Enum.ZIndexBehavior.Sibling})
@@ -2210,14 +2900,19 @@ local cleanup=make("BindableEvent",gui,{Name="Cleanup"})
 local panel=make("Frame",gui,{Name="PolarisPanel",Size=UDim2.new(0.78,0,0.80,0),Position=UDim2.fromScale(0.5,0.5),
     AnchorPoint=Vector2.new(0.5,0.5),BackgroundColor3=colors.bg,BorderSizePixel=0})
 corner(panel,18);stroke(panel)
+local panelScale=make("UIScale",panel,{Name="PanelScale",Scale=.96})
+animate(panelScale,{Scale=1},.28)
 services.polarisGui=gui
 local panelLimit=make("UISizeConstraint",panel,{MaxSize=Vector2.new(660,500)})
 local banner=make("Frame",panel,{Size=UDim2.new(1,0,0,64),BackgroundColor3=colors.card,BorderSizePixel=0})
 corner(banner,18)
-make("Frame",banner,{Size=UDim2.new(1,-24,0,1),Position=UDim2.new(0,12,1,-1),BackgroundColor3=colors.accent,BorderSizePixel=0})
-local title=label(banner,"POLARIS",UDim2.new(1,-230,0,30),UDim2.new(0,18,0,7))
+make("UIGradient",banner,{Color=ColorSequence.new(Color3.fromRGB(37,25,61),colors.card),Rotation=20})
+local accentBar=make("Frame",banner,{Name="AccentBar",Size=UDim2.new(1,-24,0,2),Position=UDim2.new(0,12,1,-2),BackgroundColor3=Color3.fromRGB(255,255,255),BorderSizePixel=0})
+make("UIGradient",accentBar,{Color=ColorSequence.new(colors.accent,colors.cyan)})
+local emblem=label(banner,"✦",UDim2.fromOffset(28,30),UDim2.fromOffset(12,7));emblem.TextColor3=colors.cyan;emblem.TextSize=27
+local title=label(banner,"POLARIS",UDim2.new(1,-252,0,30),UDim2.new(0,43,0,7))
 title.TextSize=23;title.Font=Enum.Font.GothamBold
-local subtitle=label(banner,"v0.10  /  MOBILE + PC  /  EXPERIMENTAL",UDim2.new(1,-230,0,20),UDim2.new(0,18,0,37))
+local subtitle=label(banner,"v0.16  /  MOBILE + PC",UDim2.new(1,-230,0,20),UDim2.new(0,18,0,37))
 subtitle.TextSize=11
 local sizeButton=button(banner,"PETIT",UDim2.fromOffset(84,36),UDim2.new(1,-184,0,14))
 sizeButton.TextSize=11
@@ -2234,9 +2929,16 @@ end)
 local minimize=button(banner,"—",UDim2.fromOffset(38,36),UDim2.new(1,-94,0,14))
 local close=button(banner,"×",UDim2.fromOffset(38,36),UDim2.new(1,-50,0,14))
 local reopen=button(gui,"POLARIS",UDim2.fromOffset(110,42),UDim2.new(0,12,0.45,0));reopen.Visible=false
-local function minimizePanel() panel.Visible=false;reopen.Visible=true end
+local function minimizePanel()
+    for obj in pairs(animations) do cancelAnimation(obj,true) end
+    if pressedScale then pressedScale.Scale=1;pressedScale=nil end
+    panel.Visible=false;reopen.Visible=true
+end
+local function openPanel()
+    panel.Visible=true;reopen.Visible=false;panelScale.Scale=.96;animate(panelScale,{Scale=1},.25)
+end
 bind(minimize.Activated,minimizePanel)
-bind(reopen.Activated,function() panel.Visible=true;reopen.Visible=false end)
+bind(reopen.Activated,openPanel)
 -- Drag from the header only; no permanent frame callback for dragging.
 local dragging,dragInput,dragStart,startPosition
 bind(banner.InputBegan,function(input)
@@ -2244,7 +2946,12 @@ bind(banner.InputBegan,function(input)
         dragging=true;dragStart=input.Position;startPosition=panel.Position;dragInput=input
     end
 end)
-bind(services.Input.InputEnded,function(input) if input==dragInput then dragging=false end end)
+bind(services.Input.InputEnded,function(input)
+    if input==dragInput then dragging=false end
+    if pressedScale and (input.UserInputType==Enum.UserInputType.MouseButton1 or input.UserInputType==Enum.UserInputType.Touch) then
+        animate(pressedScale,{Scale=1},.16);pressedScale=nil
+    end
+end)
 bind(services.Input.InputChanged,function(input)
     if dragging and (input.UserInputType==Enum.UserInputType.MouseMovement or input==dragInput) then
         local delta=input.Position-dragStart
@@ -2271,8 +2978,12 @@ local function showPage(name)
     name=group(name)
     pageTitle.Text=name
     for key,page in pairs(pages) do page.Visible=key==name end
+    local pageScale=pages[name] and pages[name]:FindFirstChild("PageScale")
+    if pageScale then pageScale.Scale=.985;animate(pageScale,{Scale=1},.18) end
+    pageTitle.TextTransparency=.4;animate(pageTitle,{TextTransparency=0},.18)
     for key,b in pairs(tabButtons) do
-        b.BackgroundColor3=key==name and Color3.fromRGB(37,18,25) or colors.bg
+        b:SetAttribute("SelectedTab",key==name)
+        animate(b,{BackgroundColor3=key==name and colors.selected or colors.bg})
         b.TextColor3=key==name and colors.text or colors.muted
         local line=b:FindFirstChild("SelectionLine");if line then line.Visible=key==name end
     end
@@ -2282,8 +2993,10 @@ for index,name in ipairs({"Accueil","Farm","Fruits","Equipement","Mer","Races","
         BorderSizePixel=0,CanvasSize=UDim2.new(),AutomaticCanvasSize=Enum.AutomaticSize.Y,ScrollBarThickness=3,Visible=index==1})
     make("UIListLayout",page,{Padding=UDim.new(0,10),SortOrder=Enum.SortOrder.LayoutOrder})
     make("UIPadding",page,{PaddingRight=UDim.new(0,7),PaddingBottom=UDim.new(0,12)})
+    make("UIScale",page,{Name="PageScale",Scale=1})
     pages[name],orders[name]=page,0
     local b=button(nav,name,UDim2.fromOffset(name=="Performance" and 130 or 104,36));b.LayoutOrder=index
+    b:SetAttribute("Navigation",true)
     b.TextXAlignment=Enum.TextXAlignment.Left;b.TextSize=13
     make("UIPadding",b,{PaddingLeft=UDim.new(0,12)})
     local line=make("Frame",b,{Name="SelectionLine",Size=UDim2.fromOffset(3,24),Position=UDim2.new(0,0,0.5,-12),BackgroundColor3=colors.accent,BorderSizePixel=0,Visible=index==1});corner(line,2)
@@ -2329,11 +3042,9 @@ local function row(page,textValue,isButton,height)
     end
     obj.LayoutOrder=orders[page];return obj
 end
-local welcome=row("Accueil","Chaque interrupteur lance ou arrete directement sa fonction. Les achats utilisent ton argent du jeu. Compatibilite des appels et du combat a tester dans Delta.",false)
 local summary=row("Accueil","",false)
 local stats=row("Accueil","",false)
 local action=row("Accueil","Derniere action: --",false)
-row("Accueil","Cette version implemente des actions reelles, sans garantir leur acceptation par le serveur. Raids complets, changement de mer, tous les puzzles et V3 de toutes les races ne sont pas implementes. Les nouveaux modules restent experimentaux.",false)
 local logLabel=row("Journal","Aucun evenement",false)
 logLabel.TextYAlignment=Enum.TextYAlignment.Top
 local function report(message)
@@ -2350,7 +3061,7 @@ local expectedGame=game.GameId==994732206 or knownPlace==true
 local supported=false
 local initializationDeadline=os.clock()+30
 local initializationFinished=false
-local priorityDefaults={collect=90,event=80,boss=65,quest=20,farm=10,mastery=25,item=30}
+local priorityDefaults={collect=90,event=80,boss=65,quest=20,farm=10,mastery=55,item=30,chest=35,elite=60}
 local function initializeActions()
     if initializationFinished or closed then return end
     if not expectedGame then
@@ -2381,15 +3092,16 @@ local function initializeActions()
         {"race2","Quete race V2 / fleurs",85,2},{"swordfarm","Farm cible pour epee",30,0.2},
         {"navigate","Aller au PNJ selectionne",110,0.2},
         {"shop","Acheter la liste de 18 objets",50,3,true},{"farm","Auto Farm Level",10,0.2},{"quest","Auto Quest",20,0.5},
-        {"mastery","Auto Farm Mastery",25,0.2},{"item","Auto Farm Item",30,0.2},
+        {"mastery","Auto Farm Mastery",55,0.2},{"item","Auto Farm Item",30,0.2},
         {"boss","Auto Boss",65,0.2},{"event","Auto Event",80,0.2},
+        {"chest","Auto Coffres",35,0.5},{"elite","Elites presentes",60,0.2},
         {"boat","Navigation maritime",55,0.2},{"race3","Race V3 / Arowe",75,0.2},
         {"summon","Invocation autorisee",60,0.2},{"puzzle","Puzzle Saber / plaques",40,0.2},
         {"marine","Auto Sea Beast",60,0.2},{"seafish","Auto Sea Fish",50,0.2},{"mirage","Auto recherche Mirage",85,0.2}}) do
         engine:add(table.unpack(entry))
     end
     supported=true
-    for _,button in pairs(toggleButtons) do button.Active=true;button.AutoButtonColor=true end
+    for _,button in pairs(toggleButtons) do button.Active=true;button.AutoButtonColor=false end
     status.Text="Pret / active une option"
     report("Connexion au jeu prete. Active une option ; elle demarre directement.")
 end
@@ -2422,15 +3134,15 @@ local function toggle(page,id,labelValue)
     make("UIPadding",b,{PaddingLeft=UDim.new(0,14),PaddingRight=UDim.new(0,76)})
     local track=make("Frame",b,{Name="ToggleTrack_"..id,Size=UDim2.fromOffset(44,24),Position=UDim2.new(1,-60,0.5,-12),BackgroundColor3=Color3.fromRGB(37,38,46),BorderSizePixel=0});corner(track,12);stroke(track)
     local thumb=make("Frame",track,{Size=UDim2.fromOffset(18,18),Position=UDim2.fromOffset(3,3),BackgroundColor3=colors.muted,BorderSizePixel=0});corner(thumb,9)
-    toggleWidgets[id]={track=track,thumb=thumb}
-    b.Active=supported==true;b.AutoButtonColor=supported==true
+    toggleWidgets[id]={track=track,thumb=thumb,on=false}
+    b.Active=supported==true;b.AutoButtonColor=false
     bind(b.Activated,function()
         if not engine then return end
         enableTask(id,not engine.tasks[id].enabled)
         local on=engine.tasks[id].enabled
-        track.BackgroundColor3=on and colors.accent or Color3.fromRGB(37,38,46)
-        thumb.BackgroundColor3=on and colors.text or colors.muted
-        thumb.Position=on and UDim2.fromOffset(23,3) or UDim2.fromOffset(3,3)
+        toggleWidgets[id].on=on
+        animate(track,{BackgroundColor3=on and colors.accent or Color3.fromRGB(37,38,46)})
+        animate(thumb,{BackgroundColor3=on and colors.cyan or colors.muted,Position=on and UDim2.fromOffset(23,3) or UDim2.fromOffset(3,3)},.2)
         report(engine.tasks[id].label..(engine.tasks[id].enabled and " active" or " desactive"))
     end)
 end
@@ -2444,31 +3156,21 @@ local weaponButton=row("Farm","Arme de combat : Melee",true)
 bind(weaponButton.Activated,function() config.weapon=config.weapon=="Melee" and "Sword" or "Melee";weaponButton.Text="Arme de combat : "..config.weapon end)
 local speedButton=row("Farm","Vitesse de deplacement : 220",true)
 bind(speedButton.Activated,function() config.speed=config.speed==100 and 220 or config.speed==220 and 300 or 100;speedButton.Text="Vitesse de deplacement : "..config.speed end)
-row("Farm","DEPLACEMENTS AUTOMATIQUES : MODE FANTOME TOUJOURS ACTIF. Traverse les obstacles pendant le trajet ; restaure les collisions uniquement dans un espace libre.",false)
 local ghostButton=row("Farm","APPARENCE FANTOME LOCALE  [OFF]",true)
 bind(ghostButton.Activated,function()
     local controller=services.characterController
     controller:setGhost(not controller.ghost)
     ghostButton.Text="APPARENCE FANTOME LOCALE  ["..(controller.ghost and "ON" or "OFF").."]"
 end)
-row("Farm","Vol : collisions du corps coupees pendant le trajet et restaurees a l'arrivee ou en pause. Fantome : corps translucide bleu, arme visible, combat conserve. Effet visuel local ; aucun changement de race ni invulnerabilite.",false)
-row("Farm","Catalogue historique des 3 mers, jusqu'a 2525. Le farm utilise Tool:Activate a cadence normale, sans fast attack. Le serveur peut refuser les mouvements ou les attaques. Termine ta quete manuelle avant de demarrer.",false)
-row("Farm","Sante <25 % : pause des attaques jusqu'a 65 %. Une arme Melee ou Sword doit etre disponible. Les boss sont choisis avant une nouvelle quete ; une quete en cours n'est pas abandonnee pour changer de cible.",false)
-toggle("Fruits","collect","RECHERCHE FRUITS / interrompt le farm")
+toggle("Fruits","collect","AUTO FRUITS AU SOL")
 toggle("Fruits","fruit","STOCKAGE AUTOMATIQUE")
 toggle("Fruits","gacha","RANDOM FRUIT AUTOMATIQUE")
 local range=row("Fruits","Distance de recherche : 5000 studs",true)
 bind(range.Activated,function() config.fruitRange=config.fruitRange==5000 and 1500 or 5000;range.Text="Distance de recherche : "..config.fruitRange.." studs" end)
-row("Fruits","Collecte limitee aux fruits physiques detectes dans la zone chargee. Un essai expire apres 20 s, puis le farm reprend. Active aussi le stockage. Aucun fruit n'est mange, jete ou sacrifie.",false)
-row("Fruits","Gacha : au moins 2 h entre tentatives dans cette session. Le cooldown serveur reste prioritaire. Stockage : liste historique de noms reconnus ; un fruit renomme/inconnu est conserve.",false)
 toggle("Boutique","sword","AUTO ACHAT EPEES LEGENDAIRES")
 toggle("Boutique","shop","ACHETER 18 OBJETS DE BOUTIQUE")
-row("Boutique","Liste : "..table.concat(STOCK,", ")..". Une reponse non reconnue arrete la liste. Cette fonction ne debloque pas les armes obtenues par quetes ou drops.",false)
 local retry=row("Boutique","Recommencer la liste d'achats",true)
 bind(retry.Activated,function() if adapter then adapter.resetShop();report("Liste remise au debut. Activer la boutique.") end end)
-row("Boutique","Un interrupteur pour Saddi, Shisui et Wando : acheter uniquement les epees manquantes en Sea 2. Prix Beli lu dans le dialogue, plafond interne 2 000 000 par epee et 6 000 000 au total. La reserve globale reste appliquee. Le marchand doit etre charge.",false)
-row("Epees","ACHATS ET DROPS : les boutons lancent une tentative ou un farm cible. Une epee de drop n'est jamais garantie en un clic.",false)
-row("Epees","Le marchand depend du serveur ; ce n'est pas un spawn reserve a la nuit. Aucun appel numerique de consultation/achat n'est devine. Le module utilise le dialogue du marchand charge. Aucun minuteur de spawn invente.",false)
 for _,entry in ipairs({{"Rengoku","Rengoku / farmer Snow Lurker pour Hidden Key",2},
     {"Thunder God","Pole (1st Form) / farmer Thunder God",1},{"Cyborg","Farm Cyborg / drops",1},
     {"Smoke Admiral","Jitte / farmer Smoke Admiral",2},{"Tide Keeper","Dragon Trident / farmer Tide Keeper",2},
@@ -2483,26 +3185,12 @@ for _,entry in ipairs({{"Rengoku","Rengoku / farmer Snow Lurker pour Hidden Key"
         report("Cible : "..target..". Lancement automatique. Acces et prerequis a debloquer avant.")
     end)
 end
-row("Epees","Saber, Tushita, Yama, Cursed Dual Katana, True Triple Katana, Shark Anchor et les autres chaines de quetes : modules complets indisponibles. Les 18 achats standards sont dans Boutique. Le combat normal peut echouer selon le serveur.",false)
-toggle("Races","race2","AUTO V2 : Alchemist + fleurs + combat")
-row("Races","V2 hors Draco : mer 2, niveau 850+, quete du Colisee terminee, 500 000 Beli pour l'evolution. Le module tente de demarrer la quete, ramasser les fleurs visibles, combattre des Swan Pirates pour la jaune et valider chez l'Alchemist.",false)
-row("Races","V2 prend la priorite sur le farm. Les fleurs sont detectees dans la zone chargee. Leur ramassage et les reponses de l'Alchemist doivent etre testes. Draco n'est pas pris en charge.",false)
+toggle("Races","race2","AUTO RACE V2")
 local raceInfo=row("Races","",false)
-local v3guide={Human="Human : battre Diamond, Jeremy et le troisieme boss demande par Arowe (anciens scripts : Fajita).",
-    Mink="Rabbit : collecter 30 coffres apres acceptation de la quete.",Rabbit="Rabbit : collecter 30 coffres apres acceptation de la quete.",
-    Fishman="Shark : battre un Sea Beast apparu naturellement.",Shark="Shark : battre un Sea Beast apparu naturellement.",
-    Skypiea="Angel : battre un autre joueur Angel.",Angel="Angel : battre un autre joueur Angel.",
-    Ghoul="Ghoul : battre 5 joueurs selon les conditions d'Arowe.",Cyborg="Cyborg : montrer un fruit physique a Arowe.",
-    Draco="Draco : progression specifique du Dragon Wizard non implementee."}
-local checkV3=row("Races","Consulter etat V3 (experimental)",true)
-bind(checkV3.Activated,function()
-    report("Arowe : active le module V3 ci-dessous. Son dialogue visible sera utilise ; aucun appel Wenlocktoad non verifie.")
-end)
-local visitV3=row("Races","Aller a Arowe / aide V3",true)
+local visitV3=row("Races","ALLER A AROWE",true)
 bind(visitV3.Activated,function()
     if adapter and adapter.goToNpc({"Arowe","arowe","Wenlocktoad"}) then enableTask("navigate",true);engine:start() end
 end)
-row("Races","V3 : V2 deja debloquee, niveau 1000+, Don Swan et acces requis, 2 000 000 Beli. Le menu fournit le suivi et l'acces au PNJ charge. Les objectifs V3 ne sont pas automatisés dans cette version ; accepte et valide ta quete chez Arowe.",false)
 
 -- Reversible graphics changes, applied in batches, with one added-instance listener.
 local lowGraphics=false
@@ -2516,6 +3204,12 @@ local function lighten(obj)
         obj.Enabled=false
     end
 end
+local animationButton=row("Performance","ANIMATIONS  [ON]",true)
+bind(animationButton.Activated,function()
+    config.uiAnimations=not config.uiAnimations
+    if not config.uiAnimations then for obj in pairs(animations) do cancelAnimation(obj,true) end end
+    animationButton.Text="ANIMATIONS  ["..(config.uiAnimations and "ON" or "OFF").."]"
+end)
 local graphicButton=row("Performance","MODE GRAPHIQUE LEGER  [OFF]",true)
 local fpsLabel=row("Performance","FPS client : --",false)
 local antiIdle=false
@@ -2550,14 +3244,12 @@ bind(graphicButton.Activated,function()
     end
 end)
 bind(workspace.DescendantAdded,lighten);bind(services.Lighting.DescendantAdded,lighten)
-row("Performance","Desactive temporairement ombres, particules, trails, beams et effets de post-traitement. Les valeurs d'origine sont restaurees quand tu desactives ce mode ou fermes Polaris.",false)
-row("Performance","Moteur a 5 passages/s, liste d'ennemis actualisee a 1 Hz, une requete serveur a la fois, journal limite a 25 entrees. Pas de promesse de zero lag : MuMu, ton appareil et le serveur influencent les performances.",false)
 local frames,fpsStart=0,os.clock()
 bind(services.Run.RenderStepped,function()
     frames=frames+1
     local now=os.clock()
     if now-fpsStart>=1 then
-        if panel.Visible and pages.Performance.Visible then fpsLabel.Text="FPS client : "..math.floor(frames/(now-fpsStart)+0.5) end
+        if panel.Visible and pages.Reglages.Visible then fpsLabel.Text="FPS client : "..math.floor(frames/(now-fpsStart)+0.5) end
         frames,fpsStart=0,now
     end
 end)
@@ -2570,6 +3262,8 @@ local function dispose()
     gui:SetAttribute("PolarisBlocked",false)
     if not adapter or not adapter.cleanupDeferred() then services.characterController:close() end
     closed=true;graphicsEpoch=graphicsEpoch+1
+    for obj in pairs(animations) do cancelAnimation(obj) end
+    pressedScale=nil
     if lowGraphics then
         services.Lighting.GlobalShadows=oldShadows
         for obj,value in pairs(originals) do if obj.Parent then pcall(function() obj.Enabled=value end) end end
@@ -2580,7 +3274,7 @@ bind(close.Activated,function() if dispose()~=false then gui:Destroy() end end)
 bind(cleanup.Event,dispose);bind(gui.Destroying,dispose)
 bind(services.Input.InputBegan,function(input,processed)
     if not processed and input.KeyCode==Enum.KeyCode.RightControl then
-        if panel.Visible then minimizePanel() else panel.Visible=true;reopen.Visible=false end
+        if panel.Visible then minimizePanel() else openPanel() end
     end
 end)
 
@@ -2605,25 +3299,48 @@ local function choice(page,key,titleValue,list,display)
     bind(b.Activated,function() index=index%#list+1;config[key]=list[index];b.Text=text() end)
 end
 toggle("Farm","quest","AUTO QUEST")
+local orbit=row("Farm","TOURNER AUTOUR DES PNJ / BOSS  [ON]",true)
+bind(orbit.Activated,function() config.orbitCombat=not config.orbitCombat;orbit.Text="TOURNER AUTOUR DES PNJ / BOSS  ["..(config.orbitCombat and "ON" or "OFF").."]" end)
+textSetting("Farm","orbitRadius","Rayon du cercle",4.5,3,5.5)
+textSetting("Farm","orbitSpeed","Vitesse du cercle",10,3,18)
 local replace=row("Farm","Remplacer une quete manuelle differente [OFF]",true)
 bind(replace.Activated,function() config.replaceQuest=not config.replaceQuest;replace.Text="Remplacer quete manuelle ["..(config.replaceQuest and "ON" or "OFF").."]" end)
 toggle("Maitrise","mastery","AUTO FARM MASTERY")
+local masteryMode=row("Maitrise","MODE : STYLES AUTOMATIQUES / 600",true)
+bind(masteryMode.Activated,function()
+    local was=engine and engine.tasks.mastery.enabled
+    if was then enableTask("mastery",false) end
+    config.masteryCycle=not config.masteryCycle
+    masteryMode.Text=config.masteryCycle and "MODE : STYLES AUTOMATIQUES / 600" or "MODE : EQUIPEMENT CHOISI"
+    if was then enableTask("mastery",true) end
+end)
+local styleMaterials=row("Maitrise","AUTORISER MATERIAUX / CLES / ESSENCES DES STYLES [OFF]",true)
+bind(styleMaterials.Activated,function()
+    config.allowStyleMaterials=not config.allowStyleMaterials
+    styleMaterials.Text="AUTORISER MATERIAUX / CLES / ESSENCES DES STYLES ["..(config.allowStyleMaterials and "ON" or "OFF").."]"
+end)
+local styleProgress=row("Maitrise","Styles : —",false)
+local styleList=row("Maitrise","PROGRESSION DES STYLES",true)
+bind(styleList.Activated,function() if adapter then styleProgress.Text=adapter.styleOverview() end end)
+local retryStyle=row("Maitrise","REESSAYER ACHAT STYLE",true)
+bind(retryStyle.Activated,function() if adapter then report(adapter.resetStylePurchase() and "Achats styles debloques par l'utilisateur" or "Attendre le resultat de l'achat en cours") end end)
 textSetting("Maitrise","masteryTool","Nom exact de l'equipement possede","",nil)
-textSetting("Maitrise","masteryGoal","Mastery cible",300,1,600)
+textSetting("Maitrise","masteryGoal","Mastery cible (mode equipement choisi)",600,1,600)
 textSetting("Maitrise","masteryThreshold","Seuil de finition (fraction de sante)",0.25,0.05,0.75)
-row("Maitrise","Melee / Sword : changement d'arme. Fruit / Gun : touches normales selectionnees, visee camera facultative et degats observes. Choisis uniquement des skills debloques. Tool.Level doit etre observable.",false)
 toggle("Objets","item","AUTO FARM ITEM")
 choice("Objets","itemObjective","Materiau",MATERIALS,function(x) return x.name.." / mer "..x.sea end)
 textSetting("Objets","itemQuantity","Quantite totale cible",10,1,99999)
-row("Objets","La fin depend de getInventory, pas du nombre d'ennemis vaincus. Les sources historiques doivent etre confirmees dans ta version du jeu.",false)
 toggle("Boss","boss","AUTO BOSS")
+toggle("Farm","chest","AUTO COFFRES")
+textSetting("Farm","chestRange","Rayon coffres charges (studs)",1500,25,5000)
+toggle("Boss","elite","ELITES PRESENTES / SEA 3")
+choice("Boss","eliteTarget","Elite a combattre",{"Tous","Diablo","Deandre","Urban"})
+textSetting("Boss","eliteRange","Rayon detection elites chargees",5000,25,15000)
 local bossList={};local seen={}
 for _,q in ipairs(QUESTS) do if q.boss and not seen[q.name] then seen[q.name]=true;table.insert(bossList,q.name) end end
 table.insert(bossList,"Longma");choice("Boss","bossTarget","Boss present",bossList,function(x) return ALIASES[x] or x end)
-row("Boss","Combat uniquement si le boss est charge et vivant. Aucun objet d'invocation n'est consomme.",false)
 toggle("Evenements","event","AUTO EVENT")
 choice("Evenements","eventObjective","Activite",ACTIVITIES,function(x) return x.name.." / "..x.status end)
-row("Evenements","Les modules de combat traitent uniquement une cible deja presente. Les invocations, puzzles et bateaux disposent de pages separees avec leurs limites explicites. Aucun vol ne simule une navigation maritime.",false)
 textSetting("Reglages","reserve","Reserve minimale Beli",100000,0,1000000000)
 textSetting("Reglages","gachaBudget","Budget Gacha de cette session (0 = bloque)",0,0,1000000000)
 textSetting("Reglages","gachaMaxPrice","Plafond estime par Gacha : doit couvrir le prix reel",500000,1,100000000)
@@ -2632,8 +3349,7 @@ textSetting("Reglages","shopMaxPrice","Plafond estime par achat boutique",120000
 textSetting("Reglages","speed","Vitesse de vol reglable (studs/s)",220,80,320)
 textSetting("Reglages","exitRadius","Recherche d'une sortie libre : rayon maximal studs",10,2,12)
 textSetting("Reglages","excludeFruits","Fruits exclus (noms exacts separes par virgules)","",nil)
-row("Reglages","Les plafonds sont des estimations configurees, pas un devis serveur. Les budgets reservent ces montants a chaque demande envoyee, meme si elle est refusee. Pas d'achat automatique de Robux.",false)
-for _,id in ipairs({"collect","event","boss","quest","farm","mastery","item"}) do
+for _,id in ipairs({"collect","event","boss","quest","farm","mastery","item","chest","elite"}) do
     local key="priority_"..id
     config[key]=engine and engine.tasks[id].priority or priorityDefaults[id]
     textSetting("Reglages",key,"Priorite "..id,config[key],0,150)
@@ -2650,7 +3366,6 @@ textSetting("Maitrise","skillHold","Duree de maintien de touche en secondes",0.1
 textSetting("Maitrise","skillRange","Distance de combat Fruit/Gun",30,8,100)
 local aim=row("Maitrise","Visee camera vers la cible [ON]",true)
 bind(aim.Activated,function() config.skillAim=not config.skillAim;aim.Text="Visee camera ["..(config.skillAim and "ON" or "OFF").."]" end)
-row("Maitrise","Les commandes virtuelles doivent etre disponibles. Le serveur valide les degats et cooldowns. Sans degats observes en 20 s, le module s'arrete. F/transformation n'est jamais envoye.",false)
 toggle("Navigation","boat","NAVIGATION MARITIME")
 local takeDestination=row("Navigation","Destination : position actuelle + 1000 studs devant",true)
 bind(takeDestination.Activated,function()
@@ -2667,46 +3382,39 @@ bind(applyDestination.Activated,function()
  config.boatDestination=Vector3.new(x,0,z);report("Destination bateau mise a jour")
 end)
 textSetting("Navigation","boatTolerance","Rayon d'arrivee maritime",35,10,100)
-row("Navigation","Siege actuel ou bateau possede charge. Direction et acceleration normales ; aucun tween/fly du bateau, aucun achat automatique ni evenement maritime garanti. Destruction, interruption ou 20 s sans progression : arret des commandes.",false)
 toggle("Races","race3","RACE V3 / AROWE (PARTIEL)")
 textSetting("Races","race3Budget","Budget evolution V3 (0 bloque paiement)",0,0,1000000000)
-row("Races","Arowe : lecture/acceptation/paiement par dialogue visible. Human : boss; Rabbit : coffres charges; Cyborg : fruit porte. Shark : skills sur Sea Beast charge, puis validation Arowe. Origine naturelle non deduite automatiquement. Angel/Ghoul : epreuve PvP manuelle. Draco non implemente. La fin depend de la confirmation serveur.",false)
 toggle("Invocations","summon","PREPARER UNE INVOCATION")
 choice("Invocations","summonTarget","Boss a invoquer",{"Soul Reaper","rip_indra True Form","Dough King","Darkbeard"})
 local rare=row("Invocations","Autoriser consommation de l'objet rare [OFF]",true)
 bind(rare.Activated,function() config.allowRare=not config.allowRare;rare.Text="Consommation objet rare ["..(config.allowRare and "ON" or "OFF").."]" end)
-row("Invocations","Implemente : Soul Reaper avec Hallow Essence possedee et autel historique charge. Une seule tentative ; presence du boss verifiee. Autres invocations non implementees et sans consommation. Aucun chalice/Fist sacrifies automatiquement.",false)
 toggle("Puzzles","puzzle","PUZZLE SABER : PLAQUES (PARTIEL)")
-row("Puzzles","Mer 1, niveau 200+. Lecture des 5 plaques et de la porte historique. Deux essais maximum par plaque ; verification du changement de couleur/porte. Torch, Cup, Relic, Yama, Tushita et CDK non implementes. Aucune porte ni collision de carte modifiee.",false)
 
 
 toggle("Mer","marine","AUTO SEA BEAST / SKILLS")
 toggle("Mer","seafish","AUTO SEA FISH : PIRANHA / FISH CREW / SHARK")
 textSetting("Mer","marineTargets","Cibles Auto Beast (Sea Beast,Terrorshark...)",config.marineTargets,nil)
-textSetting("Mer","marineTool","Nom exact de ton fruit/arme maritime",config.marineTool,nil)
+textSetting("Mer","marineTool","Equipement maritime (vide = auto)",config.marineTool,nil)
 textSetting("Mer","marineDetectRange","Distance de detection (zones chargees)",2500,100,5000)
 textSetting("Mer","marineHeight","Hauteur de combat souhaitee (bornee a la portee)",12,2,20)
 textSetting("Mer","marineHealthReserve","Pause/retour bateau si sante sous cette fraction",0.35,0.2,0.8)
-local patrolButton=row("Mer","Patrouille bateau si aucune cible [OFF]",true)
+local patrolButton=row("Mer","Patrouille bateau [ON]",true)
 bind(patrolButton.Activated,function() config.marinePatrol=not config.marinePatrol;patrolButton.Text="Patrouille bateau ["..(config.marinePatrol and "ON" or "OFF").."]" end)
+local offshore=row("Mer","CAP AU LARGE  [ON]",true)
+bind(offshore.Activated,function() config.marineOffshore=not config.marineOffshore;offshore.Text="CAP AU LARGE  ["..(config.marineOffshore and "ON" or "OFF").."]" end)
 textSetting("Mer","marineSearchRadius","Rayon de patrouille autour du depart",1500,250,5000)
 textSetting("Mer","marineSearchSeconds","Duree maximale de recherche sans cible (secondes)",600,60,3600)
-row("Mer","Choisir l'equipement et ses touches dans Maitrise. Detection une fois/seconde : Enemies/SeaBeasts charges, sante numerique requise. Skills uniquement ; aucun drop garanti. Combat et bateau ne sont jamais controles ensemble. Schemas de sante non reconnus : attente explicite.",false)
 toggle("Mirage","mirage","AUTO FIND / APPROCHE MIRAGE")
 textSetting("Mirage","mirageStandOff","Distance d'approche au centre de l'ile",180,80,500)
-row("Mirage","Detection de Map.MysticIsland ou Mirage Island chargee. Patrouille facultative depuis un bateau, approche avec commandes normales. Aucun spawn force, aucun scan d'iles non chargees. Resonance/Blue Gear ne sont pas simules.",false)
-local v4Info=row("V4","Verification des prerequis : non lancee",false)
-local v4Check=row("V4","Verifier les prerequis observables",true)
+local v4Info=row("V4","V4 : —",false)
+local v4Check=row("V4","V4 : VERIFIER PREREQUIS",true)
 bind(v4Check.Activated,function()
  if not adapter then return end
  local d=adapter.raceOverview(os.clock())
  v4Info.Text="Race : "..d.race.." / marqueur V2 : "..tostring(d.v2).."\nV3 confirme par ce module : "..tostring(d.v3Confirmed)..
   " / Mirror Fractal inventaire : "..(d.mirrorFractal==nil and "requete en attente; recliquer" or tostring(d.mirrorFractal))..
-  "\nMirage chargee : "..tostring(d.mirageLoaded).."\n"..d.v4
+  "\nMirage : "..tostring(d.mirageLoaded)
 end)
-row("V4","V4 hors Draco : V3, progression Sealed King / indra, Mirror Fractal, resonance lunaire sur Mirage, Blue Gear, levier, trials et horloge. Certaines etapes demandent plusieurs joueurs. Le script aide a chercher Mirage et lire l'inventaire ; trials et puzzles V4 automatiques NON IMPLEMENTES.",false)
-row("V4","Human : Strength ; Shark : Water ; Rabbit : Speed ; Angel : King ; Ghoul : Carnage ; Cyborg : Machine. Chaque trial a sa logique propre ; aucun trajet unique ne valide toutes les races. Draco suit sa propre chaine/Trial of Flames, non implementee.",false)
-row("Races","V2 hors Draco : module fleurs historique conserve, acces/argent verifies par Alchemist. Draco V2/V3/V4 : chaines specifiques non implementees. Aucune evolution annoncee uniquement parce que le personnage est arrive a un PNJ.",false)
 
 local function refresh()
     if not engine then return end
@@ -2715,10 +3423,10 @@ local function refresh()
         local entry=engine.tasks[id]
         local detail=adapter.taskStatus(id) or {}
         local widget=toggleWidgets[id]
-        if widget then
-            widget.track.BackgroundColor3=entry.enabled and colors.accent or Color3.fromRGB(37,38,46)
-            widget.thumb.BackgroundColor3=entry.enabled and colors.text or colors.muted
-            widget.thumb.Position=entry.enabled and UDim2.fromOffset(23,3) or UDim2.fromOffset(3,3)
+        if widget and widget.on~=entry.enabled then
+            widget.on=entry.enabled
+            animate(widget.track,{BackgroundColor3=entry.enabled and colors.accent or Color3.fromRGB(37,38,46)})
+            animate(widget.thumb,{BackgroundColor3=entry.enabled and colors.cyan or colors.muted,Position=entry.enabled and UDim2.fromOffset(23,3) or UDim2.fromOffset(3,3)},.2)
         end
         local textValue=entry.label..(entry.enabled and "  [ON]" or "  [OFF]").."\n"..(entry.enabled and (detail.state or entry.state or "en attente") or entry.state or "desactivee").." : "..(entry.enabled and (detail.reason or entry.reason or "") or entry.reason or "")
         if b.Text~=textValue then b.Text=textValue;b.BackgroundColor3=colors.card end
@@ -2729,12 +3437,12 @@ local function refresh()
     local data=player:FindFirstChild("Data")
     local function value(name) local v=data and data:FindFirstChild(name);return v and tostring(v.Value) or "--" end
     local race=value("Race")
-    raceInfo.Text="Race actuelle : "..race.."\n"..(v3guide[race] or "Consulte Arowe pour l'objectif de ta race.")
+    raceInfo.Text="Race : "..race
     stats.Text="Mer "..d.sea.."   |   Niveau "..value("Level").."   |   Beli "..value("Beli").."   |   Fragments "..value("Fragments")..
         "\nQuete : "..d.quest.."   |   Appels : "..d.requests.."\nGacha : "..math.floor(d.gachaWait/60).." min   |   Boutique : "..d.shop..(d.shopBlocked and " (arretee)" or "")
     if d.blocked or d.movementBlocked then if engine.running then engine:pause() end;status.Text=d.blocked or d.movementBlocked end
 end
-report("Polaris v0.10 charge. Menu compact ; toutes les actions sont OFF.")
+report("Polaris v0.16 charge.")
 refresh()
 task.spawn(function()
     local lastRefresh=0
@@ -2742,7 +3450,7 @@ task.spawn(function()
         local ok,err=pcall(function()
             if not initializationFinished then safeInitializeActions() end
             if adapter then adapter.transport:poll();adapter.maintenance(os.clock(),engine and engine.running) end
-            if engine then for _,id in ipairs({"collect","event","boss","quest","farm","mastery","item"}) do engine.tasks[id].priority=config["priority_"..id] end;engine:tick() end
+            if engine then for _,id in ipairs({"collect","event","boss","quest","farm","mastery","item","chest","elite"}) do engine.tasks[id].priority=config["priority_"..id] end;engine:tick() end
             if os.clock()-lastRefresh>=1 then lastRefresh=os.clock();refresh() end
         end)
         if not ok then if engine then engine:pause() end;warn("[Polaris] "..tostring(err));report("Arret: "..tostring(err):sub(1,200)) end

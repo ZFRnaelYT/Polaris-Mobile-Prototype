@@ -1,4 +1,4 @@
--- POLARIS v0.16 | Client experimental, sans dependance distante.
+-- POLARIS v0.17 | Client experimental, sans dependance distante.
 -- Input: polaris_mobile(1).lua v0.5, SHA256 deae6e159f1269edb6bccd6175315a4c1bb2a7161f60e184ade9da970a527dab.
 -- Implemented: shared movement, bounded exits, exact property restoration,
 -- foreground scheduler, cancellable background queue, observable inventory checks.
@@ -46,7 +46,8 @@
 
 -- v0.14: violet/cyan theme, event-driven tweens, touch feedback, animation cleanup.
 
--- v0.16: owned-boat boarding/patrol, bounded boarding retries, sea-combat return and health recovery.
+-- v0.17: owned-boat boarding/patrol, bounded boarding retries, sea-combat return and health recovery.
+-- v0.17: accepted quest recognition, bounded verified quest requests, Gacha cooldown and current fruit storage names.
 local function newEngine(adapter,clock,publish)
     local self={running=false,closed=false,tasks={},sequence={},active=nil,steps=0,prefix="POLARIS : ",since=0}
     local function status(message,severity) if severity or self.lastStatus~=message then self.lastStatus=message;publish(message,severity) end end
@@ -736,7 +737,7 @@ for _,name in ipairs({"Rocket","Spin","Chop","Spring","Bomb","Smoke","Spike","Fl
     "Falcon","Ice","Sand","Dark","Ghost","Diamond","Light","Rubber","Barrier","Magma",
     "Quake","Buddha","Love","Spider","Sound","Phoenix","Portal","Rumble","Pain",
     "Blizzard","Gravity","Mammoth","T-Rex","Dough","Shadow","Venom","Control",
-    "Spirit","Dragon","Leopard","Kitsune"}) do FRUIT_IDS[name.." Fruit"]=name.."-"..name end
+    "Spirit","Dragon","Leopard","Kitsune","Blade","Eagle","Creation","Lightning","Tiger","Gas","Yeti"}) do FRUIT_IDS[name.." Fruit"]=name.."-"..name end
 
 local function chooseQuest(sea,level,bosses,alive)
     local regular,boss
@@ -893,7 +894,10 @@ local function newAdapter(player,remote,services,config,report)
     end
     local function questMatches(ui,name)
         for _,obj in ipairs(ui:GetDescendants()) do
-            if obj:IsA("TextLabel") and (obj.Text:lower():find(name:lower(),1,true) or (ALIASES[name] and obj.Text:lower():find(ALIASES[name]:lower(),1,true))) then return true end
+            if obj:IsA("TextLabel") or obj:IsA("TextButton") then
+                local text=obj.Text:gsub("<[^>]*>", ""):lower()
+                if text:find(name:lower(),1,true) or (ALIASES[name] and text:find(ALIASES[name]:lower(),1,true)) then return true end
+            end
         end
         return false
     end
@@ -1192,12 +1196,13 @@ local function newAdapter(player,remote,services,config,report)
     local gachaVerify,storeVerify,gachaUncertain=nil,nil,false
     local storedRejected=setmetatable({},{__mode="k"})
     local questSentAt,questAttempts,ownedQuest=0,0,nil
+    local questReply="aucune reponse"
     local masteryStart,masteryLast,masteryKills,masteryTarget=0,0,0,nil
     local observedDamage,healthTrack=0,setmetatable({},{__mode="k"})
     local function state(id,value,reason) statuses[id]={state=value,reason=reason or ""} end
     local function wallet() local d=player:FindFirstChild("Data");local b=d and d:FindFirstChild("Beli");return b and b.Value or 0 end
-    local function budget(price,maxBudget)
-        return maxBudget>0 and spent+price<=maxBudget and wallet()-price>=config.reserve
+    local function budget(price,maxBudget,reserve)
+        return maxBudget>0 and spent+price<=maxBudget and wallet()-price>=(reserve or config.reserve)
     end
     local function carried()
         local result={}
@@ -1236,7 +1241,8 @@ local function newAdapter(player,remote,services,config,report)
     end
     transport.beforeSend=function(request)
         if request.id=="gacha" or request.id=="shop" then
-            request.estimate=request.id=="gacha" and config.gachaMaxPrice or config.shopMaxPrice
+            local data=player:FindFirstChild("Data");local level=data and data:FindFirstChild("Level")
+            request.estimate=request.id=="gacha" and math.min(config.gachaMaxPrice,25000+150*math.max(0,(level and level.Value or 1)-1)) or config.shopMaxPrice
             request.balance=wallet();spent=spent+request.estimate
         end
     end
@@ -1301,9 +1307,11 @@ local function newAdapter(player,remote,services,config,report)
     function adapter.resetStore() storedRejected=setmetatable({},{__mode="k"});state("fruit","en attente","Nouvel essai demande") end
     local function adoptQuest(ui)
         local level=player.Data.Level.Value
+        local match
         for _,q in ipairs(QUESTS) do
-            if q.sea==sea and q.level<=level and questMatches(ui,q.name) then return q end
+            if q.sea==sea and q.level<=level and questMatches(ui,q.name) and (not match or #q.name>#match.name) then match=q end
         end
+        return match
     end
     local function ensureQuest(now)
         local ui=questUI()
@@ -1311,6 +1319,7 @@ local function newAdapter(player,remote,services,config,report)
         local level=player.Data.Level.Value
         if ui.Visible then
             local actual=adoptQuest(ui)
+            if ownedQuest and questMatches(ui,ownedQuest.name) then actual=ownedQuest end
             local expected=ownedQuest or chooseQuest(sea,level,config.bosses,function(name) return enemies[name]~=nil end)
             if actual and expected and actual.quest==expected.quest and actual.index==expected.index then
                 activeQuest=actual;questAttempts=0;return true
@@ -1329,16 +1338,22 @@ local function newAdapter(player,remote,services,config,report)
         end
         if sea==3 and level>=2550 then error("Catalogue historique limite; nouveau palier non valide") end
         if transport:has("quest") or now-questSentAt<5 then return false end
-        if questAttempts>=2 then error("Quete non acceptee apres deux demandes; catalogue/API a verifier") end
+        if questAttempts>=2 then error("Quete non acceptee : "..tostring(activeQuest and activeQuest.name).." / "..tostring(activeQuest and activeQuest.quest).." / serveur : "..questReply) end
         activeQuest=chooseQuest(sea,level,config.bosses,function(name) return enemies[name]~=nil end)
+        if sea==1 and level<10 and player.Team and player.Team.Name=="Marines" then
+            activeQuest={name="Trainee",quest="MarineQuest",index=1,pos=CFrame.new(-2708,25,2103),spawn=CFrame.new(-2754,25,2063)}
+        end
         if not activeQuest then error("Aucune quete compatible") end
         state(currentId,"en deplacement","PNJ / "..activeQuest.name.." (catalogue historique)")
         if moveTo(activeQuest.pos,3) then
             local q=activeQuest
             if transport:send("quest",{"StartQuest",q.quest,q.index},function(ok,result)
-                questSentAt=clock();ownedQuest=q
+                questSentAt=clock();questAttempts=questAttempts+1;ownedQuest=q;questReply=tostring(result):sub(1,120)
                 if not ok then state(currentId,"erreur","Demande refusee: "..tostring(result)) end
-            end,function() return enabled.farm or enabled.quest end) then questAttempts=questAttempts+1;questSentAt=now end
+            end,function()
+                local _,_,root=character();local ui=questUI()
+                return (enabled.farm or enabled.quest) and root and ui and not ui.Visible and (root.Position-q.pos.Position).Magnitude<=8
+            end) then questSentAt=now end
         end
         return false
     end
@@ -1346,7 +1361,9 @@ local function newAdapter(player,remote,services,config,report)
         local c=character();if not c then state("farm","en attente","Respawn");activeQuest=nil;return false end
         refreshEnemies(now)
         if not ensureQuest(now) then return false end
-        return fightNamed(activeQuest.name,activeQuest.spawn,now)
+        local result=fightNamed(activeQuest.name,activeQuest.spawn,now)
+        state("farm","en combat",lastMessage)
+        return result
     end
     local function findTool(name)
         for tool in pairs(carried()) do if tool.Name==name then return tool end end
@@ -1491,14 +1508,20 @@ local function newAdapter(player,remote,services,config,report)
         if id=="gacha" then
             local data=player:FindFirstChild("Data");local level=data and data:FindFirstChild("Level")
             if not level or level.Value<50 then error("Gacha : niveau 50 requis") end
-            local price=config.gachaMaxPrice
-            if not budget(price,config.gachaBudget) then state(id,"en attente","Budget/prix maximal/reserve insuffisants");return true end
-            local before=carried()
+            local price=25000+150*math.max(0,level.Value-1)
+            if price>config.gachaMaxPrice then state(id,"en attente","Prix Gacha au-dessus du plafond");return true end
+            if not budget(price,config.gachaBudget,config.gachaReserve or 0) then state(id,"en attente","Budget/prix maximal/reserve insuffisants");return true end
+            local before=carried();local balance=wallet()
             transport:send(id,{"Cousin","Buy"},function(ok,result)
+                local reply=type(result)=="string" and result:lower() or ""
+                if ok and wallet()==balance and (reply:find("cooldown",1,true) or reply:find("must wait",1,true) or reply:find("come back",1,true)) then
+                    spent=math.max(0,spent-price);nextGacha=clock()+60
+                    state(id,"en attente","Cooldown serveur : "..tostring(result):sub(1,90));return
+                end
                 nextGacha=clock()+7200
                 gachaVerify={before=before,at=clock()}
                 state(id,"en attente","Verification du fruit; reponse : "..tostring(result):sub(1,80))
-            end,function() return enabled.gacha and budget(price,config.gachaBudget) end)
+            end,function() return enabled.gacha and budget(price,config.gachaBudget,config.gachaReserve or 0) end)
             state(id,"en attente","Demande unique en file; cooldown serveur prioritaire");return true
         end
         if id=="fruit" then
@@ -2818,7 +2841,7 @@ if pendingCleanup then
     assert(not pendingCleanup:GetAttribute("PolarisBlocked"),"Ancien arret dans un obstacle : rejoindre un espace libre ou respawn avant de reexecuter Polaris")
 end
 local config={bosses=true,weapon="Melee",speed=220,fruitRange=5000,phaseFlight=true,exitRadius=10,
- reserve=100000,gachaBudget=0,gachaMaxPrice=500000,shopBudget=0,shopMaxPrice=1200000,excludeFruits="",
+ reserve=100000,gachaBudget=1000000000,gachaReserve=0,gachaMaxPrice=500000,shopBudget=0,shopMaxPrice=1200000,excludeFruits="",
  masteryCycle=true,allowStyleMaterials=false,masteryTool="",masteryGoal=600,masteryThreshold=0.25,itemQuantity=10,replaceQuest=false,
  legendaryTargets="Saddi,Shisui,Wando",legendaryBudget=6000000,legendaryMaxPrice=2000000,
  skillKeys="Z,X",skillInterval=6,skillHold=0.15,skillRange=30,skillAim=true,
@@ -2912,7 +2935,7 @@ make("UIGradient",accentBar,{Color=ColorSequence.new(colors.accent,colors.cyan)}
 local emblem=label(banner,"✦",UDim2.fromOffset(28,30),UDim2.fromOffset(12,7));emblem.TextColor3=colors.cyan;emblem.TextSize=27
 local title=label(banner,"POLARIS",UDim2.new(1,-252,0,30),UDim2.new(0,43,0,7))
 title.TextSize=23;title.Font=Enum.Font.GothamBold
-local subtitle=label(banner,"v0.16  /  MOBILE + PC",UDim2.new(1,-230,0,20),UDim2.new(0,18,0,37))
+local subtitle=label(banner,"v0.17  /  MOBILE + PC",UDim2.new(1,-230,0,20),UDim2.new(0,18,0,37))
 subtitle.TextSize=11
 local sizeButton=button(banner,"PETIT",UDim2.fromOffset(84,36),UDim2.new(1,-184,0,14))
 sizeButton.TextSize=11
@@ -3342,7 +3365,8 @@ table.insert(bossList,"Longma");choice("Boss","bossTarget","Boss present",bossLi
 toggle("Evenements","event","AUTO EVENT")
 choice("Evenements","eventObjective","Activite",ACTIVITIES,function(x) return x.name.." / "..x.status end)
 textSetting("Reglages","reserve","Reserve minimale Beli",100000,0,1000000000)
-textSetting("Reglages","gachaBudget","Budget Gacha de cette session (0 = bloque)",0,0,1000000000)
+textSetting("Reglages","gachaBudget","Budget Gacha de cette session (0 = bloque)",1000000000,0,1000000000)
+textSetting("Reglages","gachaReserve","Reserve Beli du Gacha",0,0,1000000000)
 textSetting("Reglages","gachaMaxPrice","Plafond estime par Gacha : doit couvrir le prix reel",500000,1,100000000)
 textSetting("Reglages","shopBudget","Budget boutique de cette session (0 = bloque)",0,0,1000000000)
 textSetting("Reglages","shopMaxPrice","Plafond estime par achat boutique",1200000,1,100000000)
@@ -3442,7 +3466,7 @@ local function refresh()
         "\nQuete : "..d.quest.."   |   Appels : "..d.requests.."\nGacha : "..math.floor(d.gachaWait/60).." min   |   Boutique : "..d.shop..(d.shopBlocked and " (arretee)" or "")
     if d.blocked or d.movementBlocked then if engine.running then engine:pause() end;status.Text=d.blocked or d.movementBlocked end
 end
-report("Polaris v0.16 charge.")
+report("Polaris v0.17 charge.")
 refresh()
 task.spawn(function()
     local lastRefresh=0

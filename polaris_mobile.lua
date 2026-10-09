@@ -1,4 +1,4 @@
--- POLARIS v0.17 | Client experimental, sans dependance distante.
+-- POLARIS v0.18 | Client experimental, sans dependance distante.
 -- Input: polaris_mobile(1).lua v0.5, SHA256 deae6e159f1269edb6bccd6175315a4c1bb2a7161f60e184ade9da970a527dab.
 -- Implemented: shared movement, bounded exits, exact property restoration,
 -- foreground scheduler, cancellable background queue, observable inventory checks.
@@ -46,8 +46,9 @@
 
 -- v0.14: violet/cyan theme, event-driven tweens, touch feedback, animation cleanup.
 
--- v0.17: owned-boat boarding/patrol, bounded boarding retries, sea-combat return and health recovery.
--- v0.17: accepted quest recognition, bounded verified quest requests, Gacha cooldown and current fruit storage names.
+-- v0.18: owned-boat boarding/patrol, bounded boarding retries, sea-combat return and health recovery.
+-- v0.18: accepted quest recognition, bounded verified quest requests, Gacha cooldown and current fruit storage names.
+-- v0.18: regular quest state machine, guarded live quest catalog, owned weapon fallback and selectable tool/M1 attack.
 local function newEngine(adapter,clock,publish)
     local self={running=false,closed=false,tasks={},sequence={},active=nil,steps=0,prefix="POLARIS : ",since=0}
     local function status(message,severity) if severity or self.lastStatus~=message then self.lastStatus=message;publish(message,severity) end end
@@ -700,6 +701,11 @@ local function newCombatInput(player,config)
         if now-self.lastHit<0.55 then return true,"Attaque en recharge"..orbit end
         self.lastHit=now
         local camera=workspace.CurrentCamera
+        if config.combatMode=="Tool" then
+            local ok,err=pcall(function() tool:Activate() end)
+            if not ok then self:reset();error("Activation outil refusee : "..tostring(err)) end
+            return true,"Activation outil / sante cible "..math.ceil(eh.Health)..orbit
+        end
         if not camera or not camera.ViewportSize then
             local ok,err=pcall(function() tool:Activate() end)
             if not ok then error("Activation de l'arme refusee : "..tostring(err)) end
@@ -727,6 +733,75 @@ local function newCombatInput(player,config)
     end
     function self:close() self:reset();self.closed=true end
     return self
+end
+-- Read only the game's own quest data. Never execute a downloaded module.
+local function newQuestCatalog(history,aliases,sea)
+    local self={entries={},source="catalogue local",problem=nil}
+    local function historic(name)
+        for _,q in ipairs(history) do if q.sea==sea and (q.name==name or aliases[q.name]==name) then return q end end
+    end
+    function self:refresh()
+        self.entries={};self.problem=nil;self.source="catalogue local"
+        local rs=game:GetService("ReplicatedStorage")
+        local module=rs:FindFirstChild("Quests")
+        local modules=rs:FindFirstChild("Modules")
+        if not module and modules then module=modules:FindFirstChild("Quests") end
+        if module and module:IsA("ModuleScript") then
+            local ok,data=pcall(require,module)
+            if ok and type(data)=="table" then
+                for id,group in pairs(data) do
+                    if type(id)=="string" and type(group)=="table" then
+                        for index,entry in pairs(group) do
+                            if type(index)=="number" and type(entry)=="table" and type(entry.LevelReq)=="number" and type(entry.Task)=="table" then
+                                local name,count,total=nil,nil,0
+                                for npc,n in pairs(entry.Task) do if type(npc)=="string" and type(n)=="number" then name,count,total=npc,n,total+1 end end
+                                local region=entry.Sea or (entry.LevelReq<700 and 1 or entry.LevelReq<1500 and 2 or 3)
+                                if region==sea and total==1 and count>0 then
+                                    local old=historic(name)
+                                    local q={name=old and old.name or name,quest=id,index=index,level=entry.LevelReq,sea=sea,boss=count==1,
+                                        pos=old and old.pos,spawn=old and old.spawn,giver=entry.NPCName or entry.NPC,live=true}
+                                    table.insert(self.entries,q)
+                                end
+                            end
+                        end
+                    end
+                end
+                if #self.entries>0 then self.source="donnees du jeu";return end
+            end
+            self.problem="Module Quests absent/incompatible ou lecture refusee"
+        end
+        for _,q in ipairs(history) do if q.sea==sea then table.insert(self.entries,q) end end
+    end
+    function self:choose(level,team)
+        local best
+        for _,q in ipairs(self.entries) do
+            local marine=sea==1 and level<10 and (q.name=="Trainee" or q.quest=="MarineQuest")
+            if not q.boss and q.level<=level and (not marine or team=="Marines") and (not best or q.level>best.level) then best=q end
+        end
+        return best
+    end
+    function self:destination(q)
+        local folder=workspace:FindFirstChild("NPCs")
+        local best,distance=nil,120
+        for _,npc in ipairs(folder and folder:GetChildren() or {}) do
+            local root=npc:FindFirstChild("HumanoidRootPart") or npc:FindFirstChild("Head")
+            if root and root:IsA("BasePart") then
+                if type(q.giver)=="string" and npc.Name==q.giver then return root.CFrame end
+                if q.pos then
+                    local d=(root.Position-q.pos.Position).Magnitude
+                    if d<distance then
+                        local tagged=false
+                        for _,label in ipairs(npc:GetDescendants()) do
+                            if label:IsA("TextLabel") and label.Text:gsub("<[^>]*>",""):upper():find("QUEST",1,true) then tagged=true;break end
+                        end
+                        if tagged then best,distance=root.CFrame,d end
+                    end
+                end
+            end
+        end
+        return best or q.pos
+    end
+    self:refresh();return self
 end
 
 local STOCK = {"Katana","Cutlass","Dual Katana","Iron Mace","Triple Katana","Pipe",
@@ -903,17 +978,22 @@ local function newAdapter(player,remote,services,config,report)
     end
     local function weapon(c,h)
         local backpack=player:FindFirstChild("Backpack")
+        local fallback
         for _,bag in pairs({c,backpack}) do
             for _,tool in ipairs(bag:GetChildren()) do
                 if tool:IsA("Tool") and not tool.Name:find("Fruit",1,true) then
                     local tip=tool.ToolTip
-                    if (not config.exactWeapon or tool.Name==config.exactWeapon) and ((config.weapon=="Melee" and tip=="Melee") or (config.weapon=="Sword" and tip=="Sword")) then
-                        if tool.Parent~=c then h:EquipTool(tool) end
-                        return tool
+                    if tip=="Melee" or tip=="Sword" then
+                        if not config.exactWeapon and config.weaponFallback~=false then fallback=fallback or tool end
+                        if (not config.exactWeapon or tool.Name==config.exactWeapon) and tip==config.weapon then
+                            if tool.Parent~=c then h:EquipTool(tool) end
+                            return tool
+                        end
                     end
                 end
             end
         end
+        if fallback then if fallback.Parent~=c then h:EquipTool(fallback) end;return fallback end
     end
     local function fightNamed(name,spawn,now)
         local c,h,root=character()
@@ -1197,6 +1277,8 @@ local function newAdapter(player,remote,services,config,report)
     local storedRejected=setmetatable({},{__mode="k"})
     local questSentAt,questAttempts,ownedQuest=0,0,nil
     local questReply="aucune reponse"
+    local questCatalog=newQuestCatalog(QUESTS,ALIASES,sea)
+    local questDestination,questCharacter,questPhase=nil,nil,"selection"
     local masteryStart,masteryLast,masteryKills,masteryTarget=0,0,0,nil
     local observedDamage,healthTrack=0,setmetatable({},{__mode="k"})
     local function state(id,value,reason) statuses[id]={state=value,reason=reason or ""} end
@@ -1293,6 +1375,10 @@ local function newAdapter(player,remote,services,config,report)
     end
     function adapter.setEnabled(id,value)
         enabled[id]=value;transport:cancel(id)
+        if value and (id=="farm" or id=="quest") and not transport:has("quest") then
+            questAttempts=0;questPhase="selection";questDestination=nil;questReply="aucune reponse";ownedQuest=nil
+            questCatalog:refresh()
+        end
         if value then state(id,"en attente","") else state(id,"desactivee","") end
     end
     function adapter.pauseRequests() transport.paused=true;transport:cancel();movement:setSupportAllowed(false) end
@@ -1305,64 +1391,88 @@ local function newAdapter(player,remote,services,config,report)
     function adapter.canClose() return not movement.blocked end
     function adapter.recover(retry) return movement:stop(retry) end
     function adapter.resetStore() storedRejected=setmetatable({},{__mode="k"});state("fruit","en attente","Nouvel essai demande") end
-    local function adoptQuest(ui)
-        local level=player.Data.Level.Value
+    local function questLevel()
+        local data=player:FindFirstChild("Data");local level=data and data:FindFirstChild("Level")
+        return level and tonumber(level.Value)
+    end
+    local function adoptQuest(ui,level)
         local match
-        for _,q in ipairs(QUESTS) do
-            if q.sea==sea and q.level<=level and questMatches(ui,q.name) and (not match or #q.name>#match.name) then match=q end
+        for _,q in ipairs(questCatalog.entries) do
+            if q.level<=level and questMatches(ui,q.name) and (not match or #q.name>#match.name) then match=q end
+        end
+        if ownedQuest and questMatches(ui,ownedQuest.name) then match=ownedQuest end
+        -- A manually accepted quest can be followed using an actually loaded enemy.
+        if not match then
+            for name,list in pairs(enemies) do
+                if questMatches(ui,name) and (not match or #name>#match.name) then
+                    match={name=name,sea=sea,spawn=list[1].HumanoidRootPart.CFrame,manual=true}
+                end
+            end
         end
         return match
     end
     local function ensureQuest(now)
-        local ui=questUI()
-        if not ui then error("Interface de quete non detectee") end
-        local level=player.Data.Level.Value
+        local c=character();local level=questLevel();local ui=questUI()
+        if not c or not level or not ui then state(currentId,"en attente","Chargement personnage / niveau / interface de quete");return false end
+        if questCharacter~=c then
+            questCharacter=c;questAttempts=0;questSentAt=0;questPhase="selection";questDestination=nil
+        end
         if ui.Visible then
-            local actual=adoptQuest(ui)
-            if ownedQuest and questMatches(ui,ownedQuest.name) then actual=ownedQuest end
-            local expected=ownedQuest or chooseQuest(sea,level,config.bosses,function(name) return enemies[name]~=nil end)
-            if actual and expected and actual.quest==expected.quest and actual.index==expected.index then
-                activeQuest=actual;questAttempts=0;return true
+            local actual=adoptQuest(ui,level)
+            local expected=ownedQuest or questCatalog:choose(level,player.Team and player.Team.Name)
+            if actual and (config.followCurrentQuest~=false or (expected and actual.quest==expected.quest and actual.index==expected.index)) then
+                activeQuest=actual;questAttempts=0;questPhase="acceptee"
+                state(currentId,"en attente","Quete acceptee : "..actual.name);return true
             end
-            if config.replaceQuest then
+            if config.replaceQuest and actual~=nil then
                 if not transport:has("quest") then
-                    transport:send("quest",{"AbandonQuest"},function() questSentAt=clock() end,function() return enabled.farm or enabled.quest end)
+                    transport:send("quest",{"AbandonQuest"},function() questSentAt=clock();ownedQuest=nil;questPhase="selection" end,function() return enabled.farm or enabled.quest end)
                 end
-                state(currentId,"en attente","Remplacement de quete autorise; verification de l'affichage")
-            else state(currentId,"en attente","Conflit avec une quete manuelle; remplacement OFF") end
+                state(currentId,"en attente","Remplacement explicite de la quete")
+            else state(currentId,"en attente","Quete affichee non reconnue ou conflit; aucune quete abandonnee") end
             return false
         end
-        -- Updated identifiers/positions cannot be reconstructed from wiki prose.
-        if (sea==1 and level>=225 and level<250) or (sea==3 and level>=1575 and level<1700) then
-            error("Zone remaniee : identifiants de quete non verifies; utiliser Auto Boss ou une quete manuelle reconnue")
+        if questPhase=="acceptee" then
+            ownedQuest=nil;activeQuest=nil;questDestination=nil;questAttempts=0;questPhase="selection"
         end
-        if sea==3 and level>=2550 then error("Catalogue historique limite; nouveau palier non valide") end
-        if transport:has("quest") or now-questSentAt<5 then return false end
-        if questAttempts>=2 then error("Quete non acceptee : "..tostring(activeQuest and activeQuest.name).." / "..tostring(activeQuest and activeQuest.quest).." / serveur : "..questReply) end
-        activeQuest=chooseQuest(sea,level,config.bosses,function(name) return enemies[name]~=nil end)
-        if sea==1 and level<10 and player.Team and player.Team.Name=="Marines" then
-            activeQuest={name="Trainee",quest="MarineQuest",index=1,pos=CFrame.new(-2708,25,2103),spawn=CFrame.new(-2754,25,2063)}
+        if transport:has("quest") then state(currentId,"en attente","Demande de quete en file / serveur");return false end
+        if now-questSentAt<6 then state(currentId,"en attente","Confirmation serveur de la quete : "..questReply);return false end
+        if questAttempts>=2 then error("QUETE REFUSEE : "..tostring(activeQuest and activeQuest.name).." / "..tostring(activeQuest and activeQuest.quest).." / serveur : "..questReply.." ; aucun nouvel essai automatique") end
+        if questPhase=="selection" or not activeQuest then
+            activeQuest=questCatalog:choose(level,player.Team and player.Team.Name)
+            if sea==1 and level<10 and player.Team and player.Team.Name=="Marines" then
+                activeQuest={name="Trainee",quest="MarineQuest",index=1,pos=CFrame.new(-2708,25,2103),spawn=CFrame.new(-2754,25,2063)}
+            end
+            if not activeQuest then error("Aucune quete reguliere disponible dans les donnees accessibles") end
+            if not activeQuest.live and ((sea==1 and level>=225 and level<250) or (sea==3 and level>=1575 and level<1700) or (sea==3 and level>=2550)) then
+                error("Catalogue de cette zone non valide; module Quests du jeu indisponible. Aucune quete inventee")
+            end
+            questDestination=questCatalog:destination(activeQuest)
+            if not questDestination then error("Quete du jeu trouvee : "..activeQuest.name.." ; position du PNJ non disponible") end
+            questPhase="trajet"
         end
-        if not activeQuest then error("Aucune quete compatible") end
-        state(currentId,"en deplacement","PNJ / "..activeQuest.name.." (catalogue historique)")
-        if moveTo(activeQuest.pos,3) then
-            local q=activeQuest
-            if transport:send("quest",{"StartQuest",q.quest,q.index},function(ok,result)
-                questSentAt=clock();questAttempts=questAttempts+1;ownedQuest=q;questReply=tostring(result):sub(1,120)
-                if not ok then state(currentId,"erreur","Demande refusee: "..tostring(result)) end
-            end,function()
-                local _,_,root=character();local ui=questUI()
-                return (enabled.farm or enabled.quest) and root and ui and not ui.Visible and (root.Position-q.pos.Position).Magnitude<=8
-            end) then questSentAt=now end
-        end
+        state(currentId,"en deplacement","PNJ de quete : "..activeQuest.name.." / "..questCatalog.source)
+        if not moveTo(questDestination,3) then return false end
+        local q,destination=activeQuest,questDestination
+        if transport:send("quest",{"StartQuest",q.quest,q.index},function(ok,result)
+            questSentAt=clock();questAttempts=questAttempts+1;ownedQuest=q;questReply=tostring(result):sub(1,120);questPhase="confirmation"
+            state(currentId,"en attente","Quete demandee : "..q.name.." / serveur : "..questReply)
+        end,function()
+            local _,_,root=character();local ui=questUI()
+            return (enabled.farm or enabled.quest) and root and ui and not ui.Visible and (root.Position-destination.Position).Magnitude<=8
+        end) then questSentAt=now;questPhase="confirmation" end
         return false
     end
     farm=function(now)
-        local c=character();if not c then state("farm","en attente","Respawn");activeQuest=nil;return false end
+        local c,h=character()
+        if not c then combat:reset();state("farm","en attente","Respawn");return false end
         refreshEnemies(now)
+        local tool=weapon(c,h)
+        if not tool then combat:reset();state("farm","en attente","Aucune arme Melee/Sword possedee et utilisable");return false end
         if not ensureQuest(now) then return false end
         local result=fightNamed(activeQuest.name,activeQuest.spawn,now)
-        state("farm","en combat",lastMessage)
+        local value=movement.goal and "en deplacement" or lastMessage:find("Combat",1,true) and "en combat" or "en attente"
+        state("farm",value,lastMessage)
         return result
     end
     local function findTool(name)
@@ -2825,7 +2935,7 @@ local function newAdapter(player,remote,services,config,report)
 
     return adapter
 end
-if POLARIS_TEST then return {newEngine=newEngine,newTransport=newTransport,chooseQuest=chooseQuest,quests=QUESTS,newAdapter=newAdapter,newCharacterController=newCharacterController,newMovement=newMovement,activities=ACTIVITIES} end
+if POLARIS_TEST then return {newEngine=newEngine,newTransport=newTransport,chooseQuest=chooseQuest,quests=QUESTS,newAdapter=newAdapter,newCharacterController=newCharacterController,newMovement=newMovement,activities=ACTIVITIES,newQuestCatalog=newQuestCatalog} end
 
 local services={Players=game:GetService("Players"),TweenService=game:GetService("TweenService"),
     Input=game:GetService("UserInputService"),Lighting=game:GetService("Lighting"),Run=game:GetService("RunService")}
@@ -2840,7 +2950,7 @@ if pendingCleanup then
     pendingCleanup:Fire()
     assert(not pendingCleanup:GetAttribute("PolarisBlocked"),"Ancien arret dans un obstacle : rejoindre un espace libre ou respawn avant de reexecuter Polaris")
 end
-local config={bosses=true,weapon="Melee",speed=220,fruitRange=5000,phaseFlight=true,exitRadius=10,
+local config={bosses=false,weapon="Melee",weaponFallback=true,followCurrentQuest=true,combatMode="Tool",speed=220,fruitRange=5000,phaseFlight=true,exitRadius=10,
  reserve=100000,gachaBudget=1000000000,gachaReserve=0,gachaMaxPrice=500000,shopBudget=0,shopMaxPrice=1200000,excludeFruits="",
  masteryCycle=true,allowStyleMaterials=false,masteryTool="",masteryGoal=600,masteryThreshold=0.25,itemQuantity=10,replaceQuest=false,
  legendaryTargets="Saddi,Shisui,Wando",legendaryBudget=6000000,legendaryMaxPrice=2000000,
@@ -2935,7 +3045,7 @@ make("UIGradient",accentBar,{Color=ColorSequence.new(colors.accent,colors.cyan)}
 local emblem=label(banner,"✦",UDim2.fromOffset(28,30),UDim2.fromOffset(12,7));emblem.TextColor3=colors.cyan;emblem.TextSize=27
 local title=label(banner,"POLARIS",UDim2.new(1,-252,0,30),UDim2.new(0,43,0,7))
 title.TextSize=23;title.Font=Enum.Font.GothamBold
-local subtitle=label(banner,"v0.17  /  MOBILE + PC",UDim2.new(1,-230,0,20),UDim2.new(0,18,0,37))
+local subtitle=label(banner,"v0.18  /  MOBILE + PC",UDim2.new(1,-230,0,20),UDim2.new(0,18,0,37))
 subtitle.TextSize=11
 local sizeButton=button(banner,"PETIT",UDim2.fromOffset(84,36),UDim2.new(1,-184,0,14))
 sizeButton.TextSize=11
@@ -3322,6 +3432,11 @@ local function choice(page,key,titleValue,list,display)
     bind(b.Activated,function() index=index%#list+1;config[key]=list[index];b.Text=text() end)
 end
 toggle("Farm","quest","AUTO QUEST")
+local combatMode=row("Farm","ATTAQUE : ACTIVATION OUTIL",true)
+bind(combatMode.Activated,function()
+    config.combatMode=config.combatMode=="Tool" and "M1" or "Tool"
+    combatMode.Text=config.combatMode=="Tool" and "ATTAQUE : ACTIVATION OUTIL" or "ATTAQUE : CLIC M1"
+end)
 local orbit=row("Farm","TOURNER AUTOUR DES PNJ / BOSS  [ON]",true)
 bind(orbit.Activated,function() config.orbitCombat=not config.orbitCombat;orbit.Text="TOURNER AUTOUR DES PNJ / BOSS  ["..(config.orbitCombat and "ON" or "OFF").."]" end)
 textSetting("Farm","orbitRadius","Rayon du cercle",4.5,3,5.5)
@@ -3466,7 +3581,7 @@ local function refresh()
         "\nQuete : "..d.quest.."   |   Appels : "..d.requests.."\nGacha : "..math.floor(d.gachaWait/60).." min   |   Boutique : "..d.shop..(d.shopBlocked and " (arretee)" or "")
     if d.blocked or d.movementBlocked then if engine.running then engine:pause() end;status.Text=d.blocked or d.movementBlocked end
 end
-report("Polaris v0.17 charge.")
+report("Polaris v0.18 charge.")
 refresh()
 task.spawn(function()
     local lastRefresh=0
